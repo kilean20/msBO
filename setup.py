@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
     
-setup(name='boom',
+setup(name='msBO',
     version=0.0,
-    description='Bayesian Optimization On a Machine',
+    description='Multi-State Bayesian Optimization for FRIB Beam Tuning',
     classifiers=[
     'Development Status :: 2 - Pre-Alpha',
     'Programming Language :: Python :: 3.11.1',
