@@ -303,7 +303,7 @@ class MultiStateBO:
                          X_pending: Optional[Tensor] = None,
                          fixed_state: Optional[str] = None):
 
-        acq_type = acq_type if acq_type is not None else "KG"
+        acq_type = acq_type if acq_type is not None else "qEI"
 
         if X_pending is None and self.X_pending is not None:
             X_pending = torch.as_tensor(self.X_pending, device=self.device, dtype=self.dtype).view(1, 1, -1)
