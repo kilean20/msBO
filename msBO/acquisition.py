@@ -6,7 +6,7 @@ from botorch.acquisition.monte_carlo import MCAcquisitionFunction, SampleReducin
 from botorch.acquisition.objective import MCAcquisitionObjective
 from botorch.models.model import Model
 from botorch.sampling.base import MCSampler
-from botorch.sampling.normal import SobolQMCNormalSampler
+from botorch.sampling.normal import SobolQMCNormalSampler, IIDNormalSampler
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.acquisition.knowledge_gradient import qMultiFidelityKnowledgeGradient
 from botorch.utils.transforms import (
@@ -183,6 +183,215 @@ class fixed_state_qLogEI(SampleReducingMCAcquisitionFunction):
     def _sample_forward(self, obj: Tensor) -> Tensor:
         return (obj - (self.best_f + self.xi)).clamp_min(0.0)
 
+
+
+class two_state_qLogEI(MCAcquisitionFunction):
+    """
+    Joint q-batch LogEI for a MIXED batch across two consecutive states.
+
+    The batch is split:  X_ctrl[..., :q_s, :]  → evaluated at state  s_idx
+                         X_ctrl[..., q_s:,  :]  → evaluated at state  ns_idx
+
+    For each sub-group the relevant state's J tasks are drawn from the GP
+    posterior via MC sampling; all other tasks use their posterior *mean*
+    (same as fixed_state_qLogEI, but applied to two groups independently).
+    The composite objective is evaluated jointly over all q candidates and the
+    log-EI is taken of the *best* improvement in the batch.
+
+    This replaces a dummy oracle call at X_best when switching states.  The
+    ns_idx candidate is chosen by the acquisition itself, so it is
+    informative and non-redundant — the acquisition function balances
+    exploration/exploitation for next_s given everything already known.
+
+    Parameters
+    ----------
+    q_s   : number of candidates for the *current* state (s_idx). The
+            remaining q - q_s candidates are for next state (ns_idx).
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        best_f: float,
+        S: int,
+        J: int,
+        s_idx: int,
+        ns_idx: int,
+        q_s: int,
+        objective: MCAcquisitionObjective,
+        xi: float = 0.0,
+        sampler: Optional[MCSampler] = None,
+        X_pending: Optional[Tensor] = None,
+        mc_samples: int = 128,
+        eps: float = 1e-12,
+    ) -> None:
+        if sampler is None:
+            sampler = IIDNormalSampler(sample_shape=torch.Size([mc_samples]))
+        super().__init__(model=model, sampler=sampler, objective=objective)
+        self.best_f = float(best_f)
+        self.xi = float(xi)
+        self.eps = float(eps)
+        self.S = int(S)
+        self.J = int(J)
+        self.s_idx  = int(s_idx)
+        self.ns_idx = int(ns_idx)
+        self.q_s    = int(q_s)
+        self.T      = S * J
+        self.set_X_pending(X_pending)
+
+    @concatenate_pending_points
+    @t_batch_mode_transform()
+    def forward(self, X_ctrl: Tensor) -> Tensor:
+        *B, q_tot, d_ctrl = X_ctrl.shape
+        m  = 0 if self.X_pending is None else self.X_pending.shape[-2]
+        q  = q_tot - m
+        q_s  = min(self.q_s, q)   # guard if q < q_s
+        q_ns = q - q_s
+
+        X_cands   = X_ctrl[..., :q, :]          # (*B, q,    d)
+        X_s_cands = X_ctrl[..., :q_s,  :]       # (*B, q_s,  d)
+        X_ns_cands= X_ctrl[..., q_s:q, :]       # (*B, q_ns, d)
+
+        s_start  = self.s_idx  * self.J
+        ns_start = self.ns_idx * self.J
+        s_ids    = list(range(s_start,  s_start  + self.J))
+        ns_ids   = list(range(ns_start, ns_start + self.J))
+        all_ids  = list(range(self.T))
+        # "other" task ids seen from each group's perspective
+        s_other_ids  = [t for t in all_ids if t not in s_ids ]
+        ns_other_ids = [t for t in all_ids if t not in ns_ids]
+
+        # ── 1. MC sample state-s tasks for the s-group candidates ────────────
+        X_s_fix = _expand_tasks_concat(X_s_cands, s_ids)       # (*B, q_s*J, d+1)
+        post_s  = self.model.posterior(X_s_fix, observation_noise=False)
+        samp_s  = self.get_posterior_samples(post_s).squeeze(-1)        # nmc x *B x (q_s*J)
+        nmc     = samp_s.shape[0]
+        samp_s  = samp_s.view(nmc, *B, q_s, self.J)                    # nmc x *B x q_s x J
+
+        # ── 2. Posterior means for s-group at other tasks ────────────────────
+        X_s_oth  = _expand_tasks_concat(X_s_cands, s_other_ids)        # (*B, q_s*(T-J), d+1)
+        mu_s_oth = self.model.posterior(X_s_oth, observation_noise=False).mean.squeeze(-1)
+        mu_s_oth = mu_s_oth.view(*B, q_s, self.T - self.J)             # *B x q_s x (T-J)
+
+        # ── 3. MC sample next-state tasks for the ns-group candidates ────────
+        if q_ns > 0:
+            X_ns_fix = _expand_tasks_concat(X_ns_cands, ns_ids)
+            post_ns  = self.model.posterior(X_ns_fix, observation_noise=False)
+            samp_ns  = self.get_posterior_samples(post_ns).squeeze(-1)
+            samp_ns  = samp_ns.view(nmc, *B, q_ns, self.J)
+
+            X_ns_oth  = _expand_tasks_concat(X_ns_cands, ns_other_ids)
+            mu_ns_oth = self.model.posterior(X_ns_oth, observation_noise=False).mean.squeeze(-1)
+            mu_ns_oth = mu_ns_oth.view(*B, q_ns, self.T - self.J)
+
+        # ── 4. Assemble Y (nmc, *B, q, T) ────────────────────────────────────
+        Y = samp_s.new_empty(nmc, *B, q, self.T)
+
+        # s-group rows: MC samples for s tasks, means for the rest
+        Y[..., :q_s, s_other_ids ] = mu_s_oth.unsqueeze(0).expand(nmc, *B, q_s, self.T - self.J)
+        Y[..., :q_s, s_start : s_start + self.J] = samp_s
+
+        if q_ns > 0:
+            # ns-group rows: MC samples for ns tasks, means for the rest
+            Y[..., q_s:, ns_other_ids] = mu_ns_oth.unsqueeze(0).expand(nmc, *B, q_ns, self.T - self.J)
+            Y[..., q_s:, ns_start : ns_start + self.J] = samp_ns
+
+        # ── 5. Composite objective → joint LogEI over all q candidates ────────
+        obj         = self.objective(Y, X_cands)                         # nmc x *B x q
+        improvements= (obj - (self.best_f + self.xi)).clamp_min(0.0)
+        max_imp     = improvements.amax(dim=-1)                          # nmc x *B
+        return (max_imp.mean(dim=0) + self.eps).log()                   # *B
+
+
+class two_state_qUCB(MCAcquisitionFunction):
+    """
+    Joint q-batch UCB for a MIXED batch across two consecutive states.
+
+    Mirrors two_state_qLogEI but uses the UCB per-sample transform.
+    X_ctrl[..., :q_s, :] → evaluated at state s_idx
+    X_ctrl[..., q_s:,  :] → evaluated at state ns_idx
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        beta: float,
+        S: int,
+        J: int,
+        s_idx: int,
+        ns_idx: int,
+        q_s: int,
+        objective: MCAcquisitionObjective,
+        sampler: Optional[MCSampler] = None,
+        X_pending: Optional[Tensor] = None,
+        mc_samples: int = 128,
+    ) -> None:
+        if sampler is None:
+            sampler = IIDNormalSampler(sample_shape=torch.Size([mc_samples]))
+        super().__init__(model=model, sampler=sampler, objective=objective)
+        self.beta_prime = math.sqrt(float(beta) * math.pi / 2.0)
+        self.S = int(S); self.J = int(J)
+        self.s_idx  = int(s_idx)
+        self.ns_idx = int(ns_idx)
+        self.q_s    = int(q_s)
+        self.T      = S * J
+        self.set_X_pending(X_pending)
+
+    @concatenate_pending_points
+    @t_batch_mode_transform()
+    def forward(self, X_ctrl: Tensor) -> Tensor:
+        *B, q_tot, d_ctrl = X_ctrl.shape
+        m  = 0 if self.X_pending is None else self.X_pending.shape[-2]
+        q  = q_tot - m
+        q_s  = min(self.q_s, q)
+        q_ns = q - q_s
+
+        X_cands    = X_ctrl[..., :q, :]
+        X_s_cands  = X_ctrl[..., :q_s,  :]
+        X_ns_cands = X_ctrl[..., q_s:q, :]
+
+        s_start  = self.s_idx  * self.J
+        ns_start = self.ns_idx * self.J
+        s_ids    = list(range(s_start,  s_start  + self.J))
+        ns_ids   = list(range(ns_start, ns_start + self.J))
+        all_ids  = list(range(self.T))
+        s_other_ids  = [t for t in all_ids if t not in s_ids ]
+        ns_other_ids = [t for t in all_ids if t not in ns_ids]
+
+        X_s_fix = _expand_tasks_concat(X_s_cands, s_ids)
+        post_s  = self.model.posterior(X_s_fix, observation_noise=False)
+        samp_s  = self.get_posterior_samples(post_s).squeeze(-1)
+        nmc     = samp_s.shape[0]
+        samp_s  = samp_s.view(nmc, *B, q_s, self.J)
+
+        X_s_oth  = _expand_tasks_concat(X_s_cands, s_other_ids)
+        mu_s_oth = self.model.posterior(X_s_oth, observation_noise=False).mean.squeeze(-1)
+        mu_s_oth = mu_s_oth.view(*B, q_s, self.T - self.J)
+
+        if q_ns > 0:
+            X_ns_fix  = _expand_tasks_concat(X_ns_cands, ns_ids)
+            post_ns   = self.model.posterior(X_ns_fix, observation_noise=False)
+            samp_ns   = self.get_posterior_samples(post_ns).squeeze(-1)
+            samp_ns   = samp_ns.view(nmc, *B, q_ns, self.J)
+            X_ns_oth  = _expand_tasks_concat(X_ns_cands, ns_other_ids)
+            mu_ns_oth = self.model.posterior(X_ns_oth, observation_noise=False).mean.squeeze(-1)
+            mu_ns_oth = mu_ns_oth.view(*B, q_ns, self.T - self.J)
+
+        Y = samp_s.new_empty(nmc, *B, q, self.T)
+        Y[..., :q_s, s_other_ids ] = mu_s_oth.unsqueeze(0).expand(nmc, *B, q_s,  self.T - self.J)
+        Y[..., :q_s, s_start : s_start + self.J] = samp_s
+        if q_ns > 0:
+            Y[..., q_s:, ns_other_ids] = mu_ns_oth.unsqueeze(0).expand(nmc, *B, q_ns, self.T - self.J)
+            Y[..., q_s:, ns_start : ns_start + self.J] = samp_ns
+
+        obj = self.objective(Y, X_cands)                 # nmc x *B x q
+        mean = obj.mean(dim=0)                           # *B x q
+        ucb  = mean + self.beta_prime * (obj - mean).abs()   # nmc x *B x q
+        return ucb.amax(dim=-1).mean(dim=0)              # *B
+
+    def _sample_forward(self, obj: Tensor) -> Tensor:
+        mean = obj.mean(dim=0)
+        return mean + self.beta_prime * (obj - mean).abs()
 
 
 class CompositePosteriorMean(MCAcquisitionFunction):

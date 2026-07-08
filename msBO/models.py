@@ -48,6 +48,7 @@ def train_mtgp(
     lr: float = 0.2,
     epochs: int = 200,
     prior_model: Optional[MultiTaskGP] = None,
+    warm_start_model: Optional[MultiTaskGP] = None,
 ):
     """
     Train a (FixedNoise) MultiTaskGP on the MultiStateDataset.
@@ -56,6 +57,11 @@ def train_mtgp(
       aligning input/output spaces via the *current* model's transforms through
       non-registered callables (avoids double-registration of Modules).
     - Enforces all-or-none yvar policy at dataset level.
+    - If warm_start_model is provided, copies its hyperparameter state into the
+      freshly-built model before training begins so the optimizer starts near the
+      previously-found solution.  Incompatible keys (e.g. stale transform buffers)
+      are skipped silently (strict=False).  The caller is responsible for setting
+      a reduced ``epochs`` value to exploit the warm initialisation.
 
     Returns:
         model: trained BoTorch model in eval() mode
@@ -130,6 +136,31 @@ def train_mtgp(
         )
     else:
         model = MultiTaskGP(train_X=train_X, train_Y=train_Y, **common_kwargs)
+
+    # ----------------------------
+    # Warm start: initialise hyperparameters from a previous model.
+    # Transform buffers (Normalize / Standardize offsets/scales) are excluded
+    # because they depend on data statistics and will be recomputed on the first
+    # forward pass inside train mode anyway.
+    # ----------------------------
+    if warm_start_model is not None:
+        _TRANSFORM_PREFIXES = ("input_transform.", "outcome_transform.")
+        warm_sd = warm_start_model.state_dict()
+        # Keep only kernel / likelihood parameters, skip stale transform buffers
+        filtered_sd = {
+            k: v for k, v in warm_sd.items()
+            if not any(k.startswith(p) for p in _TRANSFORM_PREFIXES)
+        }
+        missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
+        # 'missing' will be the transform keys we intentionally skipped – fine.
+        # 'unexpected' should be empty; log a warning just in case.
+        if unexpected:
+            import warnings
+            warnings.warn(
+                f"warm_start_model: unexpected keys ignored: {unexpected}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     mll = ExactMarginalLogLikelihood(model.likelihood, model)
     model.train()

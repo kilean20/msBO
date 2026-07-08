@@ -26,7 +26,8 @@ from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikeliho
 from .utils import proximal_ordered_init_sampler
 from .models import train_mtgp
 from .dataset import MultiStateDataset, _expand_tasks_all_states, _expand_tasks_fixed_state
-from .acquisition import fixed_state_qUCB, fixed_state_qLogEI, fixed_state_qKG
+from .acquisition import (fixed_state_qUCB, fixed_state_qLogEI, fixed_state_qKG,
+                          two_state_qLogEI, two_state_qUCB, CompositePosteriorMean)
 
 
 class MultiStateBO:
@@ -52,6 +53,8 @@ class MultiStateBO:
                  acq_seed: Optional[int] = None,
                  kg_num_fantasies: int = 64,
                  fixed_mc_samples: int = 512,    # for fixed_state_qUCB/qLogEI
+                 model_train_epochs: int = 200,   # epochs for cold-start training
+                 model_warmstart_epochs: int = 50, # epochs when warm-starting from prev model
                  TurBO_failure_tolerance=999,
                  TurBO_success_tolerance=2,
                  TurBO_success_threshold=0.95,
@@ -101,6 +104,8 @@ class MultiStateBO:
 
         self.kg_num_fantasies = int(kg_num_fantasies)
         self.fixed_mc_samples = int(fixed_mc_samples)
+        self.model_train_epochs = int(model_train_epochs)
+        self.model_warmstart_epochs = int(model_warmstart_epochs)
 
         self.TurBO_success_threshold = float(TurBO_success_threshold)
         self.TurBO_failure_tolerance = TurBO_failure_tolerance
@@ -181,15 +186,35 @@ class MultiStateBO:
     def train_model(self):
         if self.use_prior_data and len(self.prior_dataset) > 0:
             t0 = time.monotonic()
-            self.prior_model, prior_loss_history = train_mtgp(self.prior_dataset)
+            self.prior_model, prior_loss_history = train_mtgp(
+                self.prior_dataset,
+                epochs=self.model_train_epochs,
+            )
             t1 = time.monotonic()
             self.history['prior_model_train_loss'].append(prior_loss_history)
             self.history['time_cost']['prior_model_train'].append(t1 - t0)
         else:
             self.prior_model = None
 
+        # Use warm start when a previous model exists.
+        # On the first call self.model is None → cold start at full epochs.
+        # On subsequent calls we initialise from the previous model and run
+        # fewer epochs (model_warmstart_epochs) since hyperparameters are
+        # already near the optimum.
+        prev_model = self.model  # None on first call
+        epochs = (
+            self.model_warmstart_epochs
+            if (prev_model is not None and self.model_warmstart_epochs < self.model_train_epochs)
+            else self.model_train_epochs
+        )
+
         t0 = time.monotonic()
-        self.model, loss_history = train_mtgp(self.dataset, prior_model=self.prior_model)
+        self.model, loss_history = train_mtgp(
+            self.dataset,
+            epochs=epochs,
+            prior_model=self.prior_model,
+            warm_start_model=prev_model,
+        )
         t1 = time.monotonic()
         self.history['model_train_loss'].append(loss_history)
         self.history['time_cost']['model_train'].append(t1 - t0)
@@ -280,6 +305,461 @@ class MultiStateBO:
         if not self.asynchronous:
             self._ingest_oracle()
             self.train_model()
+
+    def _query_q_batch(
+        self,
+        q: int,
+        botorch_bounds: Tensor,
+        fixed_state=None,
+        acq_type=None,
+        beta=None,
+        X_pending: Optional[Tensor] = None,
+    ) -> np.ndarray:
+        """
+        Optimise a q-batch acquisition and return q candidates as (q, d) numpy array.
+
+        Uses the scipy back-end because the custom torch optimiser is q=1 only.
+        The acquisition functions (fixed_state_qUCB / qLogEI / BoTorch builtins)
+        all support q>1 natively through MC sampling.
+        """
+        assert self.model is not None, "Call init() first."
+        t0 = time.monotonic()
+
+        acq_function = self._get_acquisition(
+            beta=beta,
+            botorch_bounds=botorch_bounds,
+            X_pending=X_pending,
+            fixed_state=fixed_state,
+            acq_type=acq_type,
+        )
+
+        call_idx = len(self.history["time_cost"]["query"])
+        candidate_batch, value = optimize_acqf(
+            acq_function=acq_function,
+            bounds=botorch_bounds,
+            q=int(q),
+            num_restarts=self.acq_restarts,
+            raw_samples=self.acq_raw_samples,
+            options={"maxiter": self.acq_maxiter, "ftol": self.acq_rel_tol},
+        )
+
+        dt = time.monotonic() - t0
+        self.history["time_cost"]["query"].append(dt)
+        self.history.setdefault("acq_opt", []).append({
+            "acq_type": acq_type,
+            "fixed_state": fixed_state,
+            "q": int(q),
+            "time_sec": float(dt),
+            "best_val": float(value.item()),
+            "info": {"backend": "scipy", "q": int(q)},
+        })
+
+        # candidate_batch: (1, q, d)  →  (q, d)
+        return candidate_batch.detach().cpu().numpy()    # shape (q, d), never squeeze
+
+    def _query_mixed_batch(
+        self,
+        q_s: int,
+        s,
+        q_ns: int,
+        next_s,
+        botorch_bounds: Tensor,
+        acq_type=None,
+        beta=None,
+    ):
+        """
+        Optimise a joint (q_s + q_ns) acquisition that simultaneously selects
+        q_s candidates for state ``s`` and q_ns candidates for state ``next_s``.
+
+        When q_s == 0 there is no s-group; falls back to a plain fixed-state
+        query for q_ns candidates at next_s only (avoids empty-posterior crash).
+
+        Returns
+        -------
+        candidates_s  : np.ndarray (q_s, d)  — for current state (empty if q_s=0)
+        candidates_ns : np.ndarray (q_ns, d) — for next state
+        """
+        assert self.model is not None, "Call init() first."
+
+        acq_type = acq_type or "EI"
+
+        # ── degenerate case: no candidates for current state ─────────────────
+        # two_state_* acquisitions would receive an empty posterior (0 test
+        # points) for the s-group and crash with a reshape error.  Fall back
+        # to a fixed-state query for next_s only.
+        if q_s == 0:
+            if isinstance(next_s, int):
+                ns_idx = next_s
+            else:
+                ns_idx = self.states.index(next_s)
+            cands_ns = self._query_q_batch(
+                q            = q_ns,
+                botorch_bounds = botorch_bounds,
+                fixed_state  = next_s,
+                acq_type     = acq_type,
+                beta         = beta,
+            )                                    # (q_ns, d)
+            empty_s = np.empty((0, self.ndim), dtype=np.float64)
+            return empty_s, cands_ns
+
+        t0 = time.monotonic()
+
+        if isinstance(s, int):
+            s_idx = s
+        else:
+            s_idx = self.states.index(s)
+        if isinstance(next_s, int):
+            ns_idx = next_s
+        else:
+            ns_idx = self.states.index(next_s)
+
+        q_total = q_s + q_ns
+
+        if acq_type in ("EI", "LogEI", "qEI", "qLogEI", None):
+            acq_fn = two_state_qLogEI(
+                model    = self.model,
+                best_f   = self.Y_best,
+                S        = self.S,
+                J        = self.J,
+                s_idx    = s_idx,
+                ns_idx   = ns_idx,
+                q_s      = q_s,
+                objective= self.mc_objective,
+                xi       = 0.01,
+                mc_samples = self.fixed_mc_samples,
+            )
+        elif acq_type in ("UCB", "qUCB"):
+            acq_fn = two_state_qUCB(
+                model    = self.model,
+                beta     = float(beta) if beta is not None else 0.0,
+                S        = self.S,
+                J        = self.J,
+                s_idx    = s_idx,
+                ns_idx   = ns_idx,
+                q_s      = q_s,
+                objective= self.mc_objective,
+                mc_samples = self.fixed_mc_samples,
+            )
+        else:
+            raise ValueError(
+                f"_query_mixed_batch: unsupported acq_type '{acq_type}'. "
+                "Use 'EI' or 'UCB'."
+            )
+
+        candidate_batch, value = optimize_acqf(
+            acq_function = acq_fn,
+            bounds       = botorch_bounds,
+            q            = q_total,
+            num_restarts = self.acq_restarts,
+            raw_samples  = self.acq_raw_samples,
+            options      = {"maxiter": self.acq_maxiter, "ftol": self.acq_rel_tol},
+        )
+
+        dt = time.monotonic() - t0
+        self.history["time_cost"]["query"].append(dt)
+        self.history.setdefault("acq_opt", []).append({
+            "acq_type"  : f"two_state_{acq_type}",
+            "s"         : s,
+            "next_s"    : next_s,
+            "q_s"       : q_s,
+            "q_ns"      : q_ns,
+            "time_sec"  : float(dt),
+            "best_val"  : float(value.item()),
+        })
+
+        # candidate_batch: (q_total, d)
+        cands = candidate_batch.detach().cpu().numpy()
+        return cands[:q_s], cands[q_s:]   # (q_s, d), (q_ns, d)
+
+    def step_batch(
+        self,
+        s,
+        q: int = 3,
+        local_optimization: Optional[bool] = True,
+        acq_type: Optional[str] = None,
+        beta: Optional[float] = None,
+        fix_acq_state: Optional[bool] = True,
+    ):
+        """
+        Query **q** candidates at once, evaluate them *sequentially* on the
+        machine, then retrain the model once.
+
+        Benefits vs calling ``step()`` q times:
+        - Model training happens only once per q oracle evaluations → q× fewer
+          training calls, directly proportional wall-clock saving.
+        - The q-batch acquisition considers all q candidates jointly
+          (via MC sampling), which is strictly better than q greedy q=1 queries.
+
+        Async behaviour (``self.asynchronous=True``):
+        - Training overlaps with the first oracle evaluation of the *previous*
+          batch (submitted asynchronously at the end of the last ``step_batch``).
+        - The last candidate of *this* batch is submitted asynchronously so it
+          overlaps with the model training at the start of the next ``step_batch``.
+        - The model is therefore stale by at most 1 oracle result (the last one
+          from the previous batch), identical to the staleness of regular async
+          ``step()``.
+
+        Parameters
+        ----------
+        s : state name (passed to the oracle evaluator)
+        q : batch size – number of candidates queried and evaluated per call
+        local_optimization, acq_type, beta, fix_acq_state : same as ``step()``
+        """
+        # ---- async: train now while last oracle of previous batch was running ----
+        if self.asynchronous:
+            self.train_model()
+            # Collect the last oracle result that was submitted asynchronously
+            if self.future is not None:
+                self._ingest_oracle()
+
+        fixed_state = s if fix_acq_state else None
+
+        if local_optimization:
+            lower_bound = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
+            upper_bound = np.minimum(self.X_best + 0.5 * self.local_bound_size, self.control_max)
+            botorch_bounds = torch.tensor(
+                np.vstack((lower_bound, upper_bound)), device=self.device, dtype=self.dtype
+            )
+        else:
+            botorch_bounds = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
+
+        # ---- query q candidates in one shot ----
+        candidates = self._query_q_batch(
+            q=q,
+            botorch_bounds=botorch_bounds,
+            fixed_state=fixed_state,
+            acq_type=acq_type,
+            beta=beta,
+        )  # (q, d) numpy array
+
+        # ---- evaluate candidates sequentially on the machine ----
+        if self.asynchronous:
+            # Evaluate candidates 0..q-2 synchronously (blocking); last one async
+            for cand in candidates[:-1]:
+                fut = self.executor.submit(self.multistate_oracle_evaluator, x=cand, s=s)
+                self._ingest_oracle(fut.result())
+
+            # Submit last candidate asynchronously so it overlaps with next train
+            self.X_pending = candidates[-1]
+            self.S_pending = s
+            self.future = self.executor.submit(
+                self.multistate_oracle_evaluator, x=self.X_pending, s=self.S_pending
+            )
+        else:
+            # Synchronous: evaluate all candidates, then train
+            for cand in candidates:
+                fut = self.executor.submit(self.multistate_oracle_evaluator, x=cand, s=s)
+                self._ingest_oracle(fut.result())
+            self.train_model()
+
+    def step_batch_with_switch(
+        self,
+        s,
+        next_s,
+        q: int = 3,
+        local_optimization: Optional[bool] = True,
+        acq_type: Optional[str] = None,
+        beta: Optional[float] = None,
+        fix_acq_state: Optional[bool] = True,
+    ):
+        """
+        Evaluate q-1 candidates at state ``s`` and 1 acquisition-optimal
+        candidate at state ``next_s``, then overlap model training and
+        prefetch query with the state-switch oracle evaluation.
+
+        Why (q-1, 1) mixed batch instead of a dummy oracle at X_best
+        -------------------------------------------------------------
+        The previous version sent an oracle call at X_best during the state
+        switch.  X_best is already well-explored — the model is confident
+        there and its posterior variance is low, so the measurement adds
+        near-zero information.  The acquisition function would never select
+        it again.
+
+        Instead, this version uses a ``two_state_qLogEI`` / ``two_state_qUCB``
+        acquisition that jointly optimises all q candidates at once, knowing
+        that q-1 will be measured at state ``s`` and 1 at state ``next_s``.
+        The next-state candidate is therefore chosen to maximally reduce
+        uncertainty at ``next_s`` — it is acquisition-optimal and fully
+        informative.
+
+        Timeline
+        ---------
+        ::
+
+            [train + two_state_query(q-1 at s, 1 at next_s)]
+            [oracle(x1,s)] ··· [oracle(xq-1,s)]   ← blocking
+                                                   submit oracle(x_ns*, next_s) async  ← acq-optimal
+                                                   [  train_model()   ]  ← hidden inside switch
+                                                   [  prefetch query  ]  ← hidden inside switch
+                                                   .result()            ← wait for remainder only
+                                                   ingest x_ns* result
+            prefetched candidates for next_s ready
+
+        Parameters
+        ----------
+        s      : current state — q-1 candidates are evaluated here
+        next_s : next state    — 1 acquisition-optimal candidate is evaluated
+                 here during the state switch (free in wall-clock time)
+        q      : total oracle evaluations per call at state s (q-1 measured
+                 at s, 1 measured at next_s during switch)
+        """
+        # ── 1. Consume pre-fetched candidates from the previous call ─────────
+        prefetched       = getattr(self, '_prefetched_candidates',  None)
+        prefetched_state = getattr(self, '_prefetched_state',        None)
+        ns_candidate     = getattr(self, '_switch_candidate_ns',     None)
+
+        if prefetched is not None and prefetched_state == s:
+            candidates_s  = prefetched      # (q-1, d) — pre-fetched from last call
+            candidate_ns  = ns_candidate    # (d,)     — pre-fetched next-state cand
+            self._prefetched_candidates = None
+            self._prefetched_state      = None
+            self._switch_candidate_ns   = None
+        else:
+            # First call (or state mismatch): train, then run two-state query.
+            self.train_model()
+
+            if local_optimization:
+                lb = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
+                ub = np.minimum(self.X_best + 0.5 * self.local_bound_size, self.control_max)
+                botorch_bounds = torch.tensor(np.vstack((lb, ub)), device=self.device, dtype=self.dtype)
+            else:
+                botorch_bounds = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
+
+            q_s = max(q - 1, 0)
+            candidates_s, cands_ns = self._query_mixed_batch(
+                q_s=q_s, s=s, q_ns=1, next_s=next_s,
+                botorch_bounds=botorch_bounds, acq_type=acq_type, beta=beta,
+            )
+            candidate_ns = cands_ns[0]   # (d,) — the single next-state candidate
+
+        # ── 2. Evaluate q-1 candidates at state s (blocking) ─────────────────
+        for cand in candidates_s:
+            fut = self.executor.submit(self.multistate_oracle_evaluator, x=cand, s=s)
+            self._ingest_oracle(fut.result())
+
+        # ── 3. Submit the acquisition-optimal next-state candidate async ──────
+        # The machine starts switching to next_s and simultaneously evaluates
+        # the candidate chosen by two_state acquisition — not X_best.
+        self.X_pending = candidate_ns.copy()
+        self.S_pending = next_s
+        self.future = self.executor.submit(
+            self.multistate_oracle_evaluator,
+            x=self.X_pending,
+            s=self.S_pending,
+        )
+
+        # ── 4. Train and prefetch the next round while machine switches ───────
+        # Warm-start training (~50 ep) + acquisition query both hidden inside
+        # the switch overhead (10–30 s on a real machine).
+        self.train_model()
+
+        if local_optimization:
+            lb = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
+            ub = np.minimum(self.X_best + 0.5 * self.local_bound_size, self.control_max)
+            bb_next = torch.tensor(np.vstack((lb, ub)), device=self.device, dtype=self.dtype)
+        else:
+            bb_next = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
+
+        # Prefetch: (q-1 candidates for next_s, 1 candidate for the state after)
+        # The "state after next_s" defaults to s (round-robin); callers that know
+        # the full sequence can override via the prefetch mechanism.
+        q_s_next = max(q - 1, 0)
+        next_candidates_s, next_candidate_ns = self._query_mixed_batch(
+            q_s=q_s_next, s=next_s, q_ns=1, next_s=s,
+            botorch_bounds=bb_next, acq_type=acq_type, beta=beta,
+        )
+
+        # ── 5. Collect the async switch result ────────────────────────────────
+        # Blocks only for whatever time remains after training + prefetch.
+        # Typically near-zero when switch >> warm-start training time.
+        self._ingest_oracle()
+
+        # ── 6. Store prefetched data for the next call ────────────────────────
+        self._prefetched_candidates = next_candidates_s  # (q-1, d)
+        self._prefetched_state      = next_s
+        self._switch_candidate_ns   = next_candidate_ns[0]  # (d,)
+
+        self.history.setdefault('time_cost', {}).setdefault('switch_overlap', []).append({
+            'from_state': s,
+            'to_state'  : next_s,
+        })
+
+    def recommend(
+        self,
+        local_optimization: bool = False,
+        num_restarts: Optional[int] = None,
+        raw_samples: Optional[int] = None,
+    ) -> np.ndarray:
+        """
+        Return the final recommended control setting by maximising the GP
+        posterior **mean** of the composite objective over the full control
+        space.
+
+        This is the standard Bayesian optimisation final-recommendation step.
+        Unlike ``X_best`` (the best *observed* point), this searches the full
+        space and can recommend settings that were never directly evaluated but
+        are predicted by the model to be optimal.
+
+        Why posterior mean, not an acquisition function
+        ------------------------------------------------
+        Acquisition functions (EI, UCB) trade off exploration vs exploitation
+        and are designed to select *next measurement* locations.  At the end of
+        the experiment there are no more measurements, so exploration has no
+        value.  Maximising the posterior mean is pure exploitation — it asks
+        "given everything the model has learned, where is the best setting?"
+
+        Why not just return X_best
+        --------------------------
+        ``X_best`` is constrained to the finite set of controls that were
+        actually tried.  The posterior mean optimisation searches the
+        continuous space and can find a point between observed locations that
+        the GP predicts is better.  In practice the gain is modest when the
+        dataset is large, but it is never worse and sometimes significantly
+        better, especially in early iterations.
+
+        Parameters
+        ----------
+        local_optimization : if True, restrict the search to a region of size
+            ``local_bound_size`` around the current ``X_best``.  Useful when
+            the trust region is already tight around the optimum.
+        num_restarts : number of optimisation restarts (default: acq_restarts).
+        raw_samples  : number of raw Sobol candidates (default: acq_raw_samples).
+
+        Returns
+        -------
+        x_rec : np.ndarray of shape (d,) — recommended control setting
+        f_rec : float — predicted composite objective at x_rec
+        """
+        assert self.model is not None, "No model yet — call init() first."
+
+        num_restarts = num_restarts or self.acq_restarts
+        raw_samples  = raw_samples  or self.acq_raw_samples
+
+        if local_optimization:
+            lb = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
+            ub = np.minimum(self.X_best + 0.5 * self.local_bound_size, self.control_max)
+            botorch_bounds = torch.tensor(np.vstack((lb, ub)), device=self.device, dtype=self.dtype)
+        else:
+            botorch_bounds = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
+
+        acq_fn = CompositePosteriorMean(
+            model     = self.model,
+            objective = self.mc_objective,
+            T         = int(self.S * self.J),
+        )
+
+        candidate, value = optimize_acqf(
+            acq_function = acq_fn,
+            bounds       = botorch_bounds,
+            q            = 1,
+            num_restarts = num_restarts,
+            raw_samples  = raw_samples,
+            options      = {"maxiter": self.acq_maxiter, "ftol": self.acq_rel_tol},
+        )
+
+        x_rec = candidate.view(-1).detach().cpu().numpy()
+        f_rec = float(value.item())
+        return x_rec, f_rec
 
     def _posterior_mean_composite_at(self, X_ctrl: torch.Tensor):
         device, dtype = self.device, self.dtype
