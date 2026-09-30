@@ -62,6 +62,79 @@ class BPMvar_minimization:
         return 1.0 - loss_sum + is_no_beamloss
 
 
+class QuadrupoleCentering:
+    """Composite objective for beam-based quadrupole centering.
+
+    A centered beam is insensitive to a quadrupole-strength scan.  The
+    objective therefore maximizes the negative, normalized BPM-position
+    variance across machine states.  Task ordering must follow msBO's
+    convention: all ``J`` BPM readings for state 0, then all readings for
+    state 1, and so on.
+
+    Parameters
+    ----------
+    S:
+        Number of quadrupole scan states.
+    J:
+        Number of BPM position readings returned at each state.
+    norms:
+        Per-BPM position scales.  A value of 1.0 means the corresponding BPM
+        is measured in the same units as the desired centering tolerance.
+    weights:
+        Relative per-BPM weights.  The weighted loss is normalized by their
+        sum, so multiplying every weight by the same value has no effect.
+    """
+
+    def __init__(
+        self,
+        S: int,
+        J: int,
+        norms: Optional[Union[List[float], Tensor]] = None,
+        weights: Optional[Union[List[float], Tensor]] = None,
+    ):
+        self.S = int(S)
+        self.J = int(J)
+        if self.S < 2:
+            raise ValueError("QuadrupoleCentering requires at least two scan states")
+        if self.J < 1:
+            raise ValueError("QuadrupoleCentering requires at least one BPM task")
+
+        self.norms = torch.as_tensor(
+            [1.0] * self.J if norms is None else norms,
+            dtype=torch.get_default_dtype(),
+        ).view(-1)
+        self.weights = torch.as_tensor(
+            [1.0] * self.J if weights is None else weights,
+            dtype=torch.get_default_dtype(),
+        ).view(-1)
+
+        if self.norms.numel() != self.J or self.weights.numel() != self.J:
+            raise ValueError("norms and weights must each have J entries")
+        if torch.any(self.norms <= 0):
+            raise ValueError("all norms must be positive")
+        if torch.any(self.weights < 0) or not bool(self.weights.sum() > 0):
+            raise ValueError("weights must be non-negative with a positive sum")
+
+    def __call__(self, samples: Tensor, X: Optional[Tensor] = None) -> Tensor:
+        if samples.shape[-1] != self.S * self.J:
+            raise ValueError(
+                f"expected {self.S * self.J} state-task values, "
+                f"got shape {tuple(samples.shape)}"
+            )
+
+        # (..., q, S*J) -> (..., q, S, J)
+        y = samples.unflatten(-1, (self.S, self.J))
+        norms = self.norms.to(device=y.device, dtype=y.dtype)
+        weights = self.weights.to(device=y.device, dtype=y.dtype)
+        y_scaled = y / norms
+
+        # Population variance matches the deterministic multi-condition scan
+        # interpretation and remains well-scaled for a two-state scan.
+        state_variance = torch.var(y_scaled, dim=-2, correction=0)
+        loss = (state_variance * weights).sum(dim=-1) / weights.sum()
+        return -loss
+
+
 # class MultiTaskIndexing:
 #     def __init__(self,
 #                  task_names: List[str],
@@ -117,5 +190,4 @@ class BPMvar_minimization:
 #             torch.stack([self.weights[i] * self.objfuncs[i](y[..., self.y_index[i]]) for i in range(self.n_obj)]),
 #             dim=0
 #         )
-
 

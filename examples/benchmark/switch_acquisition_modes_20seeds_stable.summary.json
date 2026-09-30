@@ -1,0 +1,36 @@
+{
+  "by_mode": [
+    {
+      "mode": "conditional",
+      "runs": 20,
+      "objective_mean": -6.444190752155747e-07,
+      "objective_median": -1.6875384034356628e-07,
+      "objective_std": 1.1414609690738085e-06,
+      "distance_median": 0.0007076005890072531,
+      "elapsed_median_sec": 4.359000000025844,
+      "query_total_median_sec": 2.007999999943422,
+      "query_max_median_sec": 0.5699999999778811,
+      "bridge_compute_max_median_sec": 0.7339999999967404,
+      "overlap_compute_max_median_sec": 0.39850000001024455,
+      "bad_initial_candidate_warnings": 0
+    },
+    {
+      "mode": "global",
+      "runs": 20,
+      "objective_mean": -1.074449670567131e-06,
+      "objective_median": -2.6255964384947427e-07,
+      "objective_std": 2.460701637680433e-06,
+      "distance_median": 0.0008626885066428867,
+      "elapsed_median_sec": 4.2889999999897555,
+      "query_total_median_sec": 2.052499999932479,
+      "query_max_median_sec": 0.5629999999946449,
+      "bridge_compute_max_median_sec": 0.6559999999881256,
+      "overlap_compute_max_median_sec": 0.4609999999811407,
+      "bad_initial_candidate_warnings": 0
+    }
+  ],
+  "paired": {
+    "conditional_wins_vs_global": 12,
+    "conditional_ties_vs_global": 0
+  }
+}

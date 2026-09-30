@@ -76,11 +76,27 @@ The dominant cost is the **Cholesky factorisation** of $\mathbf{K}_\theta$, whic
 The surrogate model is only useful if it tells us *where to measure next*.
 This is decided by an **acquisition function** $\alpha(\mathbf{x})$: a scalar that balances **exploitation** (points where the model predicts a high objective) against **exploration** (points where the model is uncertain and might be hiding something better).
 
-### 3.1 Fixed-state acquisition
+### 3.1 Acquisition semantics for a scheduled state
 
-Because the machine can only be in one state at a time, msBO uses a **fixed-state acquisition function**.
-When deciding where to measure in state $s$, only the tasks belonging to that state are sampled from the GP posterior; all other-state tasks use their posterior *mean* (i.e. the model's best current estimate).
-This matches reality: you cannot simultaneously measure all states, so you exploit what you already know about the states not currently being scanned.
+The machine can measure only one state at a time. `step_batch_with_switch()` therefore exposes three ways to value a candidate through `acq_state_mode`:
+
+- `"conditional"` is the `step_batch_with_switch()` default. It samples the diagnostics observable in the scheduled categorical state and propagates the information through learned cross-task covariance.
+- `"global"` samples all $T=S J$ state-task predictions. This is ordinary global qLogEI and remains an important benchmark.
+- `"mean"` is the legacy fixed-state approximation: it samples only the scheduled state's $J$ tasks and substitutes posterior means for all other tasks.
+
+The state labels are categorical identifiers, not real-valued coordinates. For a candidate control setting $\mathbf{x}$, let $\mathbf{f}_s(\mathbf{x})$ be the unobserved noise-free beam-response vector under state $s$, and let $\mathbf{y}_s=\mathbf{f}_s+\boldsymbol\epsilon_s$ be the averaged machine reading. Conditional mode draws $\mathbf{y}_s$ and uses the standard noisy Gaussian update:
+
+$$
+\mathbf{m}^{(r)}_{\mathrm{all}}
+= \boldsymbol{\mu}_{\mathrm{all}}
++ \boldsymbol{\Sigma}_{\mathrm{all},s}
+  (\boldsymbol{\Sigma}_{s,s}+\mathbf{R}_s)^{-1}
+  (\mathbf{y}^{(r)}_s-\boldsymbol{\mu}_s),
+$$
+
+where $\mathbf{R}_s$ is the observation-noise covariance. The conditional mode scores the composite objective on these updated means. It is state-aware but is not a full look-ahead acquisition: it neither searches the full control domain for a future optimum inside every sample nor creates and refits fantasy GP models. For a batch of $q$ controls, it samples and solves a $qJ$ observable block rather than a $qSJ$ block; it still obtains cross-covariances with all tasks, so speed relative to global EI is workload-dependent.
+
+The exact name **conditional-state qLogEI (CS-qLogEI)** is specific to this project rather than a canonical published acquisition. Its components are standard GP conditioning [Rasmussen and Williams (2006)](https://gaussianprocess.org/gpml/chapters/), expected improvement for composite functions [Astudillo and Frazier (2019)](https://proceedings.mlr.press/v97/astudillo19a.html), and numerically stable LogEI [Ament et al. (2023)](https://proceedings.neurips.cc/paper_files/paper/2023/hash/419f72cbd568ad62183f8132a3605a2a-Abstract-Conference.html). It is a same-batch-location approximation to value-of-information ideas such as knowledge gradient, not an implementation of full KG. See [the dedicated method note](conditional_state_qLogEI.md) for derivation, limitations, benchmark results, and diagrams.
 
 Two acquisition functions are available:
 
@@ -96,7 +112,7 @@ $$
 \alpha_{\text{UCB}}(\mathbf{x}) = \mu(\mathbf{x}) + \beta\,\sigma(\mathbf{x})
 $$
 
-Both are evaluated via **Monte Carlo sampling**: hundreds of joint samples are drawn from the GP posterior and passed through the composite objective $f$, giving an unbiased stochastic estimate of $\alpha$.
+EI and UCB are evaluated via **Monte Carlo sampling**: joint samples are drawn from the relevant GP posterior and passed through the composite objective $f$.
 The acquisition is then maximised over the control space using gradient-based optimisation.
 
 ### 3.2 Knowledge Gradient (KG)
@@ -262,7 +278,7 @@ In wall-clock terms the savings depend on hardware, but on a CPU the model retra
 | Component | Role | Key parameter |
 |---|---|---|
 | Multi-Task GP | Surrogate that shares information across states and observables | `complexity` of the virtual machine; $T = S \times J$ tasks |
-| Fixed-state acquisition (EI / UCB / KG) | Selects next measurement point for one state, using model knowledge of all states | `acq_type`, `beta` |
+| Scheduled-state acquisition | Conditional-state qLogEI values what the scheduled state can reveal; global and legacy mean-fill modes remain available | `acq_state_mode`, `acq_type` |
 | Trust region (TurBO) | Restricts search to a dynamically-sized region around the current best | `local_bound_size`, `TurBO_*` thresholds |
 | Multi-batch (`step_batch`) | Evaluates $q$ candidates per retraining call | `q = n_each` |
 | Warm start | Initialises hyperparameters from the previous model | `model_warmstart_epochs = 50` |

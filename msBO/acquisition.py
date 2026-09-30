@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 from botorch.acquisition.monte_carlo import MCAcquisitionFunction, SampleReducingMCAcquisitionFunction
 from botorch.acquisition.objective import MCAcquisitionObjective
 from botorch.models.model import Model
+from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.sampling.base import MCSampler
 from botorch.sampling.normal import SobolQMCNormalSampler, IIDNormalSampler
 from botorch.acquisition.acquisition import AcquisitionFunction
@@ -13,9 +14,11 @@ from botorch.utils.transforms import (
     concatenate_pending_points,
     t_batch_mode_transform,
 )
+from botorch.utils.safe_math import fatmax, log_fatplus, logmeanexp
 
 from types import MethodType
 from botorch.models.model import FantasizeMixin
+from gpytorch.distributions import MultivariateNormal
 
 
 
@@ -35,6 +38,67 @@ def _split_other_ids(T: int, start: int, J: int):
     left = list(range(0, start))
     right = list(range(start + J, T))
     return left + right, len(left), len(right)
+
+
+def _posterior_with_observation_noise(model: Model, X: Tensor) -> GPyTorchPosterior:
+    """Return a noisy posterior, including a MultiTaskGP compatibility path.
+
+    BoTorch 0.11's ``MultiTaskGP.posterior`` rejects
+    ``observation_noise=True``.  msBO nevertheless needs the predictive
+    distribution of the *measurement* for the conditional Gaussian update.
+    For that model, infer the fitted likelihood variance and add it to the
+    already-untransformed latent posterior.  Fixed-noise models use the mean
+    training variance for each requested task, which is the best available
+    prediction when future per-reading variances are not known in advance.
+    """
+    try:
+        return model.posterior(X, observation_noise=True)
+    except NotImplementedError:
+        latent = model.posterior(X, observation_noise=False)
+
+    likelihood = getattr(model, "likelihood", None)
+    noise = getattr(likelihood, "noise", None)
+    if noise is None:
+        raise NotImplementedError(
+            "conditional-state qLogEI cannot infer observation noise for "
+            f"likelihood {type(likelihood).__name__}"
+        )
+
+    noise = noise.to(device=X.device, dtype=X.dtype)
+    n_test = X.shape[-2]
+    if noise.numel() == 1:
+        test_noise = noise.reshape(*([1] * (X.ndim - 2)), 1).expand(*X.shape[:-2], n_test)
+    else:
+        train_X = model.train_inputs[0]
+        task_feature = getattr(model, "_task_feature", -1)
+        train_tasks = train_X[..., task_feature].reshape(-1)
+        train_noise = noise.reshape(-1)
+        if train_noise.numel() != train_tasks.numel():
+            raise RuntimeError(
+                "fixed observation-noise vector does not match MultiTaskGP training rows"
+            )
+        test_tasks = X[..., task_feature]
+        test_noise = torch.empty_like(test_tasks)
+        for task in test_tasks.detach().unique():
+            task_mask = train_tasks == task.to(train_tasks)
+            if not torch.any(task_mask):
+                raise RuntimeError(f"no training noise is available for task {task.item():g}")
+            test_noise = torch.where(
+                test_tasks == task,
+                train_noise[task_mask].mean().to(test_noise),
+                test_noise,
+            )
+
+    # The likelihood variance lives in standardized outcome units whereas
+    # model.posterior() has already undone msBO's Standardize transform.
+    outcome_transform = getattr(model, "outcome_transform", None)
+    stdvs = getattr(outcome_transform, "stdvs", None)
+    if stdvs is not None:
+        test_noise = test_noise * stdvs.to(test_noise).reshape(-1)[0].square()
+
+    mean = latent.mean.squeeze(-1)
+    covariance = latent.mvn.covariance_matrix + torch.diag_embed(test_noise)
+    return GPyTorchPosterior(MultivariateNormal(mean, covariance))
 
 
 class fixed_state_qUCB(SampleReducingMCAcquisitionFunction):
@@ -62,24 +126,26 @@ class fixed_state_qUCB(SampleReducingMCAcquisitionFunction):
     @concatenate_pending_points
     @t_batch_mode_transform()
     def forward(self, X_ctrl: Tensor) -> Tensor:
-        # NOTE: X_ctrl may include pending points appended by the decorator.
+        # X_ctrl includes pending points appended by the decorator.  Pending
+        # points are observations in this same fixed state, so they must remain
+        # in the joint q-batch reduction; dropping them defeats asynchronous
+        # duplicate avoidance.
         *B, q_tot, d_ctrl = X_ctrl.shape
-        m = 0 if self.X_pending is None else self.X_pending.shape[-2]
-        q = q_tot - m  # candidate batch size
+        q = q_tot
 
         start = self.s_idx * self.J
         fixed_ids = list(range(start, start + self.J))
 
-        # 1) Sample ONLY for fixed-state tasks (candidates only)
-        X_fix = _expand_tasks_concat(X_ctrl[..., :q, :], fixed_ids)          # … x (qJ) x (d+1)
+        # 1) Sample ONLY for fixed-state tasks (candidates + pending)
+        X_fix = _expand_tasks_concat(X_ctrl, fixed_ids)                      # … x (qJ) x (d+1)
         post_fix = self.model.posterior(X_fix, observation_noise=False)
         s_fix = self.get_posterior_samples(post_fix).squeeze(-1)            # nmc x … x (qJ)
         s_fix = s_fix.view(s_fix.shape[0], *B, q, self.J)                   # nmc x … x q x J
 
-        # 2) Posterior means for other tasks (candidates only)
+        # 2) Posterior means for other tasks (candidates + pending)
         other_ids, nL, nR = _split_other_ids(self.T, start, self.J)
         if other_ids:
-            X_oth = _expand_tasks_concat(X_ctrl[..., :q, :], other_ids)
+            X_oth = _expand_tasks_concat(X_ctrl, other_ids)
             mu_oth = self.model.posterior(X_oth, observation_noise=False).mean.squeeze(-1)
             mu_oth = mu_oth.view(*B, q, self.T - self.J)                    # … x q x (T-J)
         else:
@@ -95,7 +161,7 @@ class fixed_state_qUCB(SampleReducingMCAcquisitionFunction):
             Y[..., start + self.J:] = mu_oth[..., nL:].unsqueeze(0).expand(nmc, *mu_oth[..., nL:].shape)
 
         # 4) Composite objective per-sample (shape: nmc x … x q)
-        obj = self.objective(Y, X_ctrl[..., :q, :])
+        obj = self.objective(Y, X_ctrl)
 
         # 5) Apply per-sample UCB transform, then reduce samples (parent handles reduction)
         acq_per_sample = self._sample_forward(obj)     # (nmc x … x q)
@@ -126,7 +192,6 @@ class fixed_state_qLogEI(SampleReducingMCAcquisitionFunction):
         sampler: Optional[MCSampler] = None,
         X_pending: Optional[Tensor] = None,
         mc_samples: int = 128,
-        eps: float = 1e-12,
     ) -> None:
         if sampler is None:
             sampler = SobolQMCNormalSampler(
@@ -141,20 +206,21 @@ class fixed_state_qLogEI(SampleReducingMCAcquisitionFunction):
     @t_batch_mode_transform()
     def forward(self, X_ctrl: Tensor) -> Tensor:
         *B, q_tot, d_ctrl = X_ctrl.shape
-        m = 0 if self.X_pending is None else self.X_pending.shape[-2]
-        q = q_tot - m
+        # Pending points belong to this fixed state and participate in the
+        # joint improvement calculation, matching BoTorch's qEI semantics.
+        q = q_tot
 
         start = self.s_idx * self.J
         fixed_ids = list(range(start, start + self.J))
 
-        X_fix = _expand_tasks_concat(X_ctrl[..., :q, :], fixed_ids)
+        X_fix = _expand_tasks_concat(X_ctrl, fixed_ids)
         post_fix = self.model.posterior(X_fix, observation_noise=False)
         s_fix = self.get_posterior_samples(post_fix).squeeze(-1)            # nmc x … x (qJ)
         s_fix = s_fix.view(s_fix.shape[0], *B, q, self.J)                   # nmc x … x q x J
 
         other_ids, nL, nR = _split_other_ids(self.T, start, self.J)
         if other_ids:
-            X_oth = _expand_tasks_concat(X_ctrl[..., :q, :], other_ids)
+            X_oth = _expand_tasks_concat(X_ctrl, other_ids)
             mu_oth = self.model.posterior(X_oth, observation_noise=False).mean.squeeze(-1)
             mu_oth = mu_oth.view(*B, q, self.T - self.J)
         else:
@@ -168,7 +234,7 @@ class fixed_state_qLogEI(SampleReducingMCAcquisitionFunction):
         if nR > 0:
             Y[..., start + self.J:] = mu_oth[..., nL:].unsqueeze(0).expand(nmc, *mu_oth[..., nL:].shape)
 
-        obj = self.objective(Y, X_ctrl[..., :q, :])                         # nmc x … x q
+        obj = self.objective(Y, X_ctrl)                                     # nmc x … x q
 
         per_sample = self._sample_forward(obj)         # improvements (nmc x … x q)
         per_sample_max = per_sample.amax(dim=-1)       # (nmc x …)  # max over q per sample
@@ -182,6 +248,130 @@ class fixed_state_qLogEI(SampleReducingMCAcquisitionFunction):
     # return per-sample improvement (no log, no averaging here)
     def _sample_forward(self, obj: Tensor) -> Tensor:
         return (obj - (self.best_f + self.xi)).clamp_min(0.0)
+
+
+class conditional_state_qLogEI(MCAcquisitionFunction):
+    """State-aware qLogEI without fantasy-model refits.
+
+    A machine evaluation at one state reveals only that state's ``J`` tasks.
+    For every Monte-Carlo draw of those observable tasks, this acquisition
+    computes the closed-form posterior mean of the beam responses for *all*
+    ``S * J`` state-diagnostic tasks
+    conditional on the draw, then evaluates the composite objective.  It
+    therefore propagates information through learned cross-state covariance
+    without granting the candidate unobservable uncertainty from other states.
+
+    Unlike a conventional fantasy/look-ahead acquisition, no fantasy GP is
+    built or re-optimised.  For ``q`` points it samples a ``q * J`` Gaussian and
+    solves one ``q * J`` conditioning system.  It still obtains the latent
+    cross-state covariance needed to update all ``q * S * J`` outputs, so its
+    practical speed relative to global qEI is model- and batch-dependent.
+
+    ``X_pending`` is valid when the pending points will be measured in the same
+    state.  The switch scheduler deliberately omits a pending point from a
+    different state.
+    """
+
+    def __init__(
+        self,
+        model: Model,
+        best_f: float,
+        S: int,
+        J: int,
+        s_idx: int,
+        objective: MCAcquisitionObjective,
+        xi: float = 0.0,
+        sampler: Optional[MCSampler] = None,
+        X_pending: Optional[Tensor] = None,
+        mc_samples: int = 128,
+        eps: float = 1e-12,
+    ) -> None:
+        if sampler is None:
+            sampler = SobolQMCNormalSampler(sample_shape=torch.Size([mc_samples]))
+        super().__init__(model=model, sampler=sampler, objective=objective)
+        self.best_f = float(best_f)
+        self.xi = float(xi)
+        self.S = int(S)
+        self.J = int(J)
+        self.s_idx = int(s_idx)
+        self.T = self.S * self.J
+        self.set_X_pending(X_pending)
+
+    def _conditional_mean_samples(self, X_ctrl: Tensor) -> Tensor:
+        """Draw scheduled-state observations and return updated mean samples.
+
+        The returned tensor has shape ``nmc x *batch x q x (S*J)``.  Samples
+        include the model's observation noise, while the quantities being
+        updated are the unobserved noise-free beam responses.  Thus the
+        Gaussian update uses
+
+        ``Cov(f_all, y_s) = Cov(f_all, f_s)`` and
+        ``Var(y_s) = Var(f_s) + Var(noise)``.
+        """
+        *B, q, _ = X_ctrl.shape
+
+        # One joint latent posterior supplies the mean of every task and the
+        # latent cross-covariance from all tasks to the observable state.
+        X_all = _expand_tasks_concat(X_ctrl, list(range(self.T)))
+        posterior_all = self.model.posterior(X_all, observation_noise=False)
+        mu_all = posterior_all.mean.squeeze(-1)                 # *B x (q*T)
+        cov_all = posterior_all.mvn.covariance_matrix           # *B x (q*T) x (q*T)
+
+        start = self.s_idx * self.J
+        point_offsets = torch.arange(q, device=X_ctrl.device) * self.T
+        state_offsets = torch.arange(
+            start, start + self.J, device=X_ctrl.device
+        )
+        obs_idx = (point_offsets[:, None] + state_offsets[None, :]).reshape(-1)
+
+        X_obs = _expand_tasks_concat(
+            X_ctrl, list(range(start, start + self.J))
+        )
+        posterior_obs = _posterior_with_observation_noise(self.model, X_obs)
+        mu_obs = posterior_obs.mean.squeeze(-1)                 # *B x (q*J)
+        cov_obs = posterior_obs.mvn.covariance_matrix           # latent + noise
+        cov_all_obs = cov_all.index_select(-1, obs_idx)         # latent cross-covariance
+
+        # Stabilise both sampling and conditioning with a scale-aware diagonal
+        # jitter.  The same matrix is used in both places, so the samples and
+        # Gaussian update remain internally consistent.
+        diag_scale = cov_obs.diagonal(dim1=-2, dim2=-1).mean(dim=-1)
+        base_jitter = 1e-8 if X_ctrl.dtype == torch.float64 else 1e-5
+        jitter = base_jitter * diag_scale.clamp_min(1.0)
+        eye = torch.eye(obs_idx.numel(), device=X_ctrl.device, dtype=X_ctrl.dtype)
+        cov_obs_stable = cov_obs + jitter[..., None, None] * eye
+
+        stable_obs_posterior = GPyTorchPosterior(
+            MultivariateNormal(mu_obs, cov_obs_stable)
+        )
+        samples_obs = self.get_posterior_samples(stable_obs_posterior).squeeze(-1)
+        centered = samples_obs - mu_obs.unsqueeze(0)             # nmc x *B x (q*J)
+
+        chol = torch.linalg.cholesky(cov_obs_stable)
+        weights = torch.cholesky_solve(
+            centered.unsqueeze(-1), chol.unsqueeze(0)
+        )
+        delta = torch.matmul(cov_all_obs.unsqueeze(0), weights).squeeze(-1)
+        conditional_mean = mu_all.unsqueeze(0) + delta           # nmc x *B x (q*T)
+        return conditional_mean.view(samples_obs.shape[0], *B, q, self.T)
+
+    @concatenate_pending_points
+    @t_batch_mode_transform()
+    def forward(self, X_ctrl: Tensor) -> Tensor:
+        Y = self._conditional_mean_samples(X_ctrl)
+
+        obj = self.objective(Y, X_ctrl)                           # nmc x *B x q
+
+        # Mirror BoTorch qLogEI's numerically stable reductions.  A literal
+        # clamp followed by log creates a flat acquisition whenever every raw
+        # sample is below best_f; that caused BadInitialCandidatesWarning and
+        # unreliable restarts in the first benchmark implementation.
+        threshold = torch.as_tensor(
+            self.best_f + self.xi, device=obj.device, dtype=obj.dtype
+        )
+        log_improvement = log_fatplus(obj - threshold, tau=1e-6)
+        log_best_in_batch = fatmax(log_improvement, dim=-1, tau=1e-2)
+        return logmeanexp(log_best_in_batch, dim=0)
 
 
 

@@ -26,7 +26,7 @@ from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikeliho
 from .utils import proximal_ordered_init_sampler
 from .models import train_mtgp
 from .dataset import MultiStateDataset, _expand_tasks_all_states, _expand_tasks_fixed_state
-from .acquisition import (fixed_state_qUCB, fixed_state_qLogEI, fixed_state_qKG,
+from .acquisition import (fixed_state_qUCB, fixed_state_qLogEI, conditional_state_qLogEI, fixed_state_qKG,
                           two_state_qLogEI, two_state_qUCB, CompositePosteriorMean)
 
 
@@ -131,6 +131,8 @@ class MultiStateBO:
 
         self.prior_model = None
         self.model = None
+        self._model_raw_count = -1
+        self._switch_prefetch = None
         self.X_best = None
         self.Y_best = None
 
@@ -146,13 +148,18 @@ class MultiStateBO:
         }
 
     def _ingest_oracle(self, oracle: Dict = None) -> None:
+        """Collect an oracle result and append it to the datasets."""
         if oracle is None:
             assert self.future is not None, "No future to get result from."
-            oracle = self.future.result()
-            self.X_pending = None
-            self.S_pending = None
-            self.future = None
-        """Append oracle data into datasets."""
+            pending_future = self.future
+            try:
+                oracle = pending_future.result()
+            finally:
+                # A failed machine call must not leave a completed/failed future
+                # attached forever and poison every later scheduler call.
+                self.X_pending = None
+                self.S_pending = None
+                self.future = None
         self.dataset.concat_data(x=oracle["x"], s=self.states.index(oracle["state"]), y=oracle["y"])
         if self.use_prior_data and self.prior_dataset is not None and "ramping_x" in oracle:
             self.prior_dataset.concat_data(x=oracle["ramping_x"], s=self.states.index(oracle["ramping_state"]),
@@ -220,11 +227,46 @@ class MultiStateBO:
         self.history['time_cost']['model_train'].append(t1 - t0)
         self.X_best, self.Y_best = self._get_model_based_X_best()
         self._update_turbo_counters_and_trust_region()
+        self._model_raw_count = len(self.dataset._x)
 
         # Snapshot predictions after training
         self.snapshot_predictions()
 
-    def init(self, n_init, local_optimization=True):
+    @staticmethod
+    def _resolve_acq_state_mode(
+        fix_acq_state: Optional[bool],
+        acq_state_mode: Optional[str],
+        *,
+        default: str,
+    ) -> str:
+        """Resolve explicit state semantics while preserving the legacy bool."""
+        aliases = {
+            "global": "global",
+            "mean": "mean",
+            "fixed": "mean",
+            "fixed_mean": "mean",
+            "conditional": "conditional",
+        }
+        if acq_state_mode is not None:
+            key = str(acq_state_mode).strip().lower()
+            if key not in aliases:
+                raise ValueError(
+                    "acq_state_mode must be 'global', 'mean', or 'conditional', "
+                    f"got {acq_state_mode!r}"
+                )
+            return aliases[key]
+        if fix_acq_state is None:
+            return aliases[default]
+        return "mean" if bool(fix_acq_state) else "global"
+
+    def init(self, n_init, local_optimization=True, seed: Optional[int] = None):
+        """Collect the shared QMC initial design at every state.
+
+        ``seed`` controls the Sobol design itself.  Seeding NumPy or Torch alone
+        does not seed SciPy's QMC engine.
+        """
+
+        self._switch_prefetch = None
 
         if local_optimization:
             lower_bound = np.maximum(self.x0 - 0.5 * self.local_bound_size, self.control_min)
@@ -240,7 +282,7 @@ class MultiStateBO:
             ramping_rate=None,
             polarity_change_time=None,
             method='sobol',
-            seed=None)
+            seed=seed)
         init_x = np.vstack((self.x0.reshape(1, -1), init_x))
 
         self.X_pending = init_x[0]
@@ -272,17 +314,27 @@ class MultiStateBO:
              beta: Optional[float] = None,
              X_pending: Optional[Tensor] = None,
              fix_acq_state: Optional[bool] = True,
+             acq_state_mode: Optional[str] = None,
              ):
+
+        # Any non-switch step invalidates route-specific prefetched candidates.
+        self._switch_prefetch = None
+
+        state_mode = self._resolve_acq_state_mode(
+            fix_acq_state, acq_state_mode, default="mean"
+        )
 
         if self.asynchronous:
             self.train_model()
             if X_pending is None:
                 X_pending = self.X_pending
+                if state_mode != "global" and self.S_pending != s:
+                    X_pending = torch.empty(
+                        (1, 0, self.ndim), device=self.device, dtype=self.dtype
+                    )
 
-        if fix_acq_state:
-            fixed_state = s
-        else:
-            fixed_state = None
+        fixed_state = s if state_mode == "mean" else None
+        condition_on_state = s if state_mode == "conditional" else None
 
         if local_optimization:
             lower_bound = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
@@ -290,8 +342,14 @@ class MultiStateBO:
             botorch_bounds = torch.tensor(np.vstack((lower_bound, upper_bound)), device=self.device, dtype=self.dtype)
         else:
             botorch_bounds = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
-        candidate = self.query_candidate(botorch_bounds, X_pending=X_pending, fixed_state=fixed_state, acq_type=acq_type,
-                                         beta=beta)
+        candidate = self.query_candidate(
+            botorch_bounds,
+            X_pending=X_pending,
+            fixed_state=fixed_state,
+            condition_on_state=condition_on_state,
+            acq_type=acq_type,
+            beta=beta,
+        )
 
         if self.asynchronous:
             self._ingest_oracle()
@@ -314,6 +372,7 @@ class MultiStateBO:
         acq_type=None,
         beta=None,
         X_pending: Optional[Tensor] = None,
+        condition_on_state=None,
     ) -> np.ndarray:
         """
         Optimise a q-batch acquisition and return q candidates as (q, d) numpy array.
@@ -330,6 +389,7 @@ class MultiStateBO:
             botorch_bounds=botorch_bounds,
             X_pending=X_pending,
             fixed_state=fixed_state,
+            condition_on_state=condition_on_state,
             acq_type=acq_type,
         )
 
@@ -348,6 +408,7 @@ class MultiStateBO:
         self.history.setdefault("acq_opt", []).append({
             "acq_type": acq_type,
             "fixed_state": fixed_state,
+            "condition_on_state": condition_on_state,
             "q": int(q),
             "time_sec": float(dt),
             "best_val": float(value.item()),
@@ -366,10 +427,19 @@ class MultiStateBO:
         botorch_bounds: Tensor,
         acq_type=None,
         beta=None,
+        fix_acq_state: bool = True,
     ):
         """
         Optimise a joint (q_s + q_ns) acquisition that simultaneously selects
         q_s candidates for state ``s`` and q_ns candidates for state ``next_s``.
+
+        With ``fix_acq_state=True``, use the observation-aware two-state
+        acquisition: each candidate contributes posterior samples only for the
+        state where it will actually be measured.  With
+        ``fix_acq_state=False``, optimise the ordinary global q-batch
+        acquisition over the full multitask posterior and split its candidates
+        between the two machine states.  The latter preserves the global-EI
+        behavior used by the benchmark notebooks.
 
         When q_s == 0 there is no s-group; falls back to a plain fixed-state
         query for q_ns candidates at next_s only (avoids empty-posterior crash).
@@ -382,6 +452,21 @@ class MultiStateBO:
         assert self.model is not None, "Call init() first."
 
         acq_type = acq_type or "EI"
+        q_total = q_s + q_ns
+
+        # Global acquisition: jointly choose q_total control points using the
+        # full multitask posterior, then assign the first q_s to ``s`` and the
+        # remainder to ``next_s``.  This preserves the historically strong
+        # global-EI behavior selected by fix_acq_state=False.
+        if not fix_acq_state:
+            cands = self._query_q_batch(
+                q=q_total,
+                botorch_bounds=botorch_bounds,
+                fixed_state=None,
+                acq_type=acq_type,
+                beta=beta,
+            )
+            return cands[:q_s], cands[q_s:]
 
         # ── degenerate case: no candidates for current state ─────────────────
         # two_state_* acquisitions would receive an empty posterior (0 test
@@ -413,8 +498,6 @@ class MultiStateBO:
         else:
             ns_idx = self.states.index(next_s)
 
-        q_total = q_s + q_ns
-
         if acq_type in ("EI", "LogEI", "qEI", "qLogEI", None):
             acq_fn = two_state_qLogEI(
                 model    = self.model,
@@ -425,7 +508,10 @@ class MultiStateBO:
                 ns_idx   = ns_idx,
                 q_s      = q_s,
                 objective= self.mc_objective,
-                xi       = 0.01,
+                # Match BoTorch qLogEI's default improvement threshold.  A
+                # hard-coded 0.01 is scale-dependent and makes EI identically
+                # zero once a non-positive centering objective is near zero.
+                xi       = 0.0,
                 mc_samples = self.fixed_mc_samples,
             )
         elif acq_type in ("UCB", "qUCB"):
@@ -479,6 +565,7 @@ class MultiStateBO:
         acq_type: Optional[str] = None,
         beta: Optional[float] = None,
         fix_acq_state: Optional[bool] = True,
+        acq_state_mode: Optional[str] = None,
     ):
         """
         Query **q** candidates at once, evaluate them *sequentially* on the
@@ -503,8 +590,12 @@ class MultiStateBO:
         ----------
         s : state name (passed to the oracle evaluator)
         q : batch size – number of candidates queried and evaluated per call
-        local_optimization, acq_type, beta, fix_acq_state : same as ``step()``
+        local_optimization, acq_type, beta, fix_acq_state,
+        acq_state_mode : same as ``step()``
         """
+        # Any plain batch interrupts the switch route and invalidates its prefetch.
+        self._switch_prefetch = None
+
         # ---- async: train now while last oracle of previous batch was running ----
         if self.asynchronous:
             self.train_model()
@@ -512,7 +603,11 @@ class MultiStateBO:
             if self.future is not None:
                 self._ingest_oracle()
 
-        fixed_state = s if fix_acq_state else None
+        state_mode = self._resolve_acq_state_mode(
+            fix_acq_state, acq_state_mode, default="mean"
+        )
+        fixed_state = s if state_mode == "mean" else None
+        condition_on_state = s if state_mode == "conditional" else None
 
         if local_optimization:
             lower_bound = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
@@ -528,6 +623,7 @@ class MultiStateBO:
             q=q,
             botorch_bounds=botorch_bounds,
             fixed_state=fixed_state,
+            condition_on_state=condition_on_state,
             acq_type=acq_type,
             beta=beta,
         )  # (q, d) numpy array
@@ -560,128 +656,275 @@ class MultiStateBO:
         local_optimization: Optional[bool] = True,
         acq_type: Optional[str] = None,
         beta: Optional[float] = None,
-        fix_acq_state: Optional[bool] = True,
+        fix_acq_state: Optional[bool] = None,
+        acq_state_mode: Optional[str] = None,
+        following_s=None,
+        prefetch_next: Optional[bool] = None,
     ):
         """
-        Evaluate q-1 candidates at state ``s`` and 1 acquisition-optimal
-        candidate at state ``next_s``, then overlap model training and
-        prefetch query with the state-switch oracle evaluation.
+        Evaluate q-1 candidates at state ``s`` and one bridge candidate at
+        ``next_s``.  Computation is overlapped with two already-paid machine
+        operations, without selecting a candidate for a state beyond
+        ``next_s``:
 
-        Why (q-1, 1) mixed batch instead of a dummy oracle at X_best
-        -------------------------------------------------------------
-        The previous version sent an oracle call at X_best during the state
-        switch.  X_best is already well-explored — the model is confident
-        there and its posterior variance is low, so the measurement adds
-        near-zero information.  The acquisition function would never select
-        it again.
+        * while the final state-s measurement is pending, update the model and
+          select the bridge point for ``next_s``;
+        * while switching to and measuring that bridge point, update the model
+          with all completed state-s data and prefetch only the remaining q-1
+          candidates for ``next_s``.
 
-        Instead, this version uses a ``two_state_qLogEI`` / ``two_state_qUCB``
-        acquisition that jointly optimises all q candidates at once, knowing
-        that q-1 will be measured at state ``s`` and 1 at state ``next_s``.
-        The next-state candidate is therefore chosen to maximally reduce
-        uncertainty at ``next_s`` — it is acquisition-optimal and fully
-        informative.
+        Thus the prefetched next-state batch is stale by at most its one
+        explicitly pending bridge observation.  It is never selected before an
+        intervening state's entire batch has been collected.
 
         Timeline
         ---------
         ::
 
-            [train + two_state_query(q-1 at s, 1 at next_s)]
-            [oracle(x1,s)] ··· [oracle(xq-1,s)]   ← blocking
-                                                   submit oracle(x_ns*, next_s) async  ← acq-optimal
-                                                   [  train_model()   ]  ← hidden inside switch
-                                                   [  prefetch query  ]  ← hidden inside switch
-                                                   .result()            ← wait for remainder only
-                                                   ingest x_ns* result
-            prefetched candidates for next_s ready
+            [oracle(x1,s)] ··· [oracle(xq-2,s)]
+            submit oracle(xq-1,s) async
+                [train + query one bridge x* for next_s]  ← overlaps final read
+            ingest xq-1
+            submit oracle(x*,next_s) async                 ← switch + read
+                [train + query q-1 points for next_s]      ← overlaps switch
+            ingest x*
+            next-state-only batch ready
 
         Parameters
         ----------
         s      : current state — q-1 candidates are evaluated here
         next_s : next state    — 1 acquisition-optimal candidate is evaluated
-                 here during the state switch (free in wall-clock time)
-        q      : total oracle evaluations per call at state s (q-1 measured
-                 at s, 1 measured at next_s during switch)
+                 here as the machine switches, making the transition productive
+        q      : q-1 measurements at s plus one bridge measurement at next_s.
+                 A closed state cycle therefore contributes q measurements to
+                 every state.
+        prefetch_next : whether to prefetch q-1 candidates for ``next_s`` for a
+                 subsequent call.  Use False on the final transition of a
+                 finite route.
+        following_s : deprecated compatibility marker.  When prefetch_next is
+                 omitted, a non-None following_s means prefetch_next=True.  Its
+                 identity is never used by the acquisition.
+        fix_acq_state : backward-compatible selector.  Explicit False means
+                 global EI; explicit True means the legacy state-fixed
+                 mean-fill heuristic.  When both selectors are omitted, the
+                 switch scheduler defaults to conditional-state EI.
+        acq_state_mode : explicit acquisition semantics: ``"global"``,
+                 ``"mean"``, or ``"conditional"``.  ``"conditional"`` samples
+                 only the tasks observable in the scheduled state and uses a
+                 closed-form Gaussian update to propagate their information to
+                 the other tasks.  It does not build fantasy models.  When
+                 provided, this option takes precedence over ``fix_acq_state``.
+
+        Notes
+        -----
+        A prefetch is consumed only when its measurement state, q, acquisition
+        settings, and bounds mode match this call.  The outgoing destination is
+        deliberately irrelevant because the prefetch contains only state-s
+        measurements.
         """
-        # ── 1. Consume pre-fetched candidates from the previous call ─────────
-        prefetched       = getattr(self, '_prefetched_candidates',  None)
-        prefetched_state = getattr(self, '_prefetched_state',        None)
-        ns_candidate     = getattr(self, '_switch_candidate_ns',     None)
-
-        if prefetched is not None and prefetched_state == s:
-            candidates_s  = prefetched      # (q-1, d) — pre-fetched from last call
-            candidate_ns  = ns_candidate    # (d,)     — pre-fetched next-state cand
-            self._prefetched_candidates = None
-            self._prefetched_state      = None
-            self._switch_candidate_ns   = None
+        if q < 1:
+            raise ValueError(f"q must be at least 1, got {q}")
+        for name, state in (("s", s), ("next_s", next_s), ("following_s", following_s)):
+            if state is not None and state not in self.states:
+                raise ValueError(f"{name}={state!r} is not in states={self.states!r}")
+        if prefetch_next is None:
+            prefetch_next = following_s is not None
         else:
-            # First call (or state mismatch): train, then run two-state query.
-            self.train_model()
+            prefetch_next = bool(prefetch_next)
 
+        state_mode = self._resolve_acq_state_mode(
+            fix_acq_state, acq_state_mode, default="conditional"
+        )
+
+        # Do not overwrite an asynchronous result left by init(), step(), or
+        # step_batch().  The switch scheduler owns its own overlap only after
+        # any earlier operation has been collected.
+        ingested_pending_on_entry = self.future is not None
+        if ingested_pending_on_entry:
+            self._ingest_oracle()
+            # A route prefetch, if one was left by external/manual state
+            # manipulation, cannot have accounted for this newly ingested
+            # outcome and must not be reused.
+            self._switch_prefetch = None
+
+        acq_key = acq_type or "EI"
+        beta_key = None if beta is None else float(beta)
+        n_current = max(int(q) - 1, 0)
+        requested_plan = {
+            "state": s,
+            "q_current": n_current,
+            "acq_type": acq_key,
+            "beta": beta_key,
+            "local_optimization": bool(local_optimization),
+            "acq_state_mode": state_mode,
+        }
+
+        def make_bounds():
             if local_optimization:
                 lb = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
                 ub = np.minimum(self.X_best + 0.5 * self.local_bound_size, self.control_max)
-                botorch_bounds = torch.tensor(np.vstack((lb, ub)), device=self.device, dtype=self.dtype)
-            else:
-                botorch_bounds = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
+                return torch.tensor(np.vstack((lb, ub)), device=self.device, dtype=self.dtype)
+            return torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
 
-            q_s = max(q - 1, 0)
-            candidates_s, cands_ns = self._query_mixed_batch(
-                q_s=q_s, s=s, q_ns=1, next_s=next_s,
-                botorch_bounds=botorch_bounds, acq_type=acq_type, beta=beta,
+        def pending_tensor(x):
+            return torch.as_tensor(x, device=self.device, dtype=self.dtype).view(1, 1, -1)
+
+        def no_pending_tensor():
+            return torch.empty((1, 0, self.ndim), device=self.device, dtype=self.dtype)
+
+        def query_for_state(state, q_query, X_pending):
+            kwargs = dict(
+                q=q_query,
+                botorch_bounds=make_bounds(),
+                acq_type=acq_type,
+                beta=beta,
+                X_pending=X_pending,
             )
-            candidate_ns = cands_ns[0]   # (d,) — the single next-state candidate
+            if state_mode == "mean":
+                kwargs["fixed_state"] = state
+            elif state_mode == "conditional":
+                kwargs["condition_on_state"] = state
+            return self._query_q_batch(**kwargs)
 
-        # ── 2. Evaluate q-1 candidates at state s (blocking) ─────────────────
-        for cand in candidates_s:
+        # ── 1. Consume a state-compatible prefetch from the previous switch ──
+        prefetched = getattr(self, "_switch_prefetch", None)
+        prefetch_used = bool(
+            prefetched is not None
+            and all(prefetched.get(k) == v for k, v in requested_plan.items())
+        )
+        self._switch_prefetch = None
+
+        if prefetch_used:
+            candidates_s = prefetched["candidates_s"]
+        else:
+            # First call or configuration mismatch: select only points that
+            # will actually be measured at the current state.
+            if self.model is None or self._model_raw_count != len(self.dataset._x):
+                self.train_model()
+            if n_current:
+                candidates_s = query_for_state(s, n_current, no_pending_tensor())
+            else:
+                candidates_s = np.empty((0, self.ndim), dtype=np.float64)
+
+        # ── 2. Evaluate all but the final current-state candidate ─────────────
+        for cand in candidates_s[:-1]:
             fut = self.executor.submit(self.multistate_oracle_evaluator, x=cand, s=s)
             self._ingest_oracle(fut.result())
 
-        # ── 3. Submit the acquisition-optimal next-state candidate async ──────
-        # The machine starts switching to next_s and simultaneously evaluates
-        # the candidate chosen by two_state acquisition — not X_best.
+        # ── 3. Select the bridge while the final state-s read is in flight ────
+        current_compute_t0 = time.monotonic()
+        current_wait_sec = 0.0
+        if n_current:
+            last_current = np.asarray(candidates_s[-1], dtype=float)
+            self.X_pending = last_current.copy()
+            self.S_pending = s
+            self.future = self.executor.submit(
+                self.multistate_oracle_evaluator, x=self.X_pending, s=self.S_pending
+            )
+
+            try:
+                if self.model is None or self._model_raw_count != len(self.dataset._x):
+                    self.train_model()
+
+                # A state-specific acquisition for next_s cannot represent a
+                # pending observation from a different state.  Global EI can at
+                # least use the pending control location through its ordinary
+                # X_pending path.
+                bridge_pending = (
+                    pending_tensor(last_current)
+                    if state_mode == "global"
+                    else no_pending_tensor()
+                )
+                candidate_ns = query_for_state(next_s, 1, bridge_pending)[0]
+                current_compute_sec = time.monotonic() - current_compute_t0
+            except BaseException:
+                # Leave the object in a usable state even when model training or
+                # acquisition optimization fails during an in-flight reading.
+                try:
+                    self._ingest_oracle()
+                finally:
+                    self._switch_prefetch = None
+                raise
+
+            wait_t0 = time.monotonic()
+            self._ingest_oracle()
+            current_wait_sec = time.monotonic() - wait_t0
+        else:
+            if self.model is None or self._model_raw_count != len(self.dataset._x):
+                self.train_model()
+            candidate_ns = query_for_state(next_s, 1, no_pending_tensor())[0]
+            current_compute_sec = time.monotonic() - current_compute_t0
+
+        # ── 4. Switch to next_s and measure the freshly selected bridge ───────
         self.X_pending = candidate_ns.copy()
         self.S_pending = next_s
+        switch_t0 = time.monotonic()
         self.future = self.executor.submit(
             self.multistate_oracle_evaluator,
             x=self.X_pending,
             s=self.S_pending,
         )
 
-        # ── 4. Train and prefetch the next round while machine switches ───────
-        # Warm-start training (~50 ep) + acquisition query both hidden inside
-        # the switch overhead (10–30 s on a real machine).
-        self.train_model()
+        # ── 5. During the switch, prefetch ONLY next_s measurements ───────────
+        compute_t0 = time.monotonic()
+        try:
+            if self.model is None or self._model_raw_count != len(self.dataset._x):
+                self.train_model()
 
-        if local_optimization:
-            lb = np.maximum(self.X_best - 0.5 * self.local_bound_size, self.control_min)
-            ub = np.minimum(self.X_best + 0.5 * self.local_bound_size, self.control_max)
-            bb_next = torch.tensor(np.vstack((lb, ub)), device=self.device, dtype=self.dtype)
-        else:
-            bb_next = torch.tensor(self.bounds.T, device=self.device, dtype=self.dtype)
+            next_prefetch = None
+            if prefetch_next:
+                if n_current:
+                    next_candidates_s = query_for_state(
+                        next_s, n_current, pending_tensor(candidate_ns)
+                    )
+                else:
+                    next_candidates_s = np.empty((0, self.ndim), dtype=np.float64)
+                next_prefetch = {
+                    "state": next_s,
+                    "q_current": n_current,
+                    "acq_type": acq_key,
+                    "beta": beta_key,
+                    "local_optimization": bool(local_optimization),
+                    "acq_state_mode": state_mode,
+                    "candidates_s": next_candidates_s,
+                    "model_raw_count": int(self._model_raw_count),
+                }
+            compute_sec = time.monotonic() - compute_t0
+        except BaseException:
+            try:
+                self._ingest_oracle()
+            finally:
+                self._switch_prefetch = None
+            raise
 
-        # Prefetch: (q-1 candidates for next_s, 1 candidate for the state after)
-        # The "state after next_s" defaults to s (round-robin); callers that know
-        # the full sequence can override via the prefetch mechanism.
-        q_s_next = max(q - 1, 0)
-        next_candidates_s, next_candidate_ns = self._query_mixed_batch(
-            q_s=q_s_next, s=next_s, q_ns=1, next_s=s,
-            botorch_bounds=bb_next, acq_type=acq_type, beta=beta,
-        )
-
-        # ── 5. Collect the async switch result ────────────────────────────────
-        # Blocks only for whatever time remains after training + prefetch.
-        # Typically near-zero when switch >> warm-start training time.
+        # ── 6. Collect the asynchronous bridge result ─────────────────────────
+        future_done_before_wait = self.future.done()
+        wait_t0 = time.monotonic()
         self._ingest_oracle()
+        wait_sec = time.monotonic() - wait_t0
+        switch_oracle_sec = time.monotonic() - switch_t0
 
-        # ── 6. Store prefetched data for the next call ────────────────────────
-        self._prefetched_candidates = next_candidates_s  # (q-1, d)
-        self._prefetched_state      = next_s
-        self._switch_candidate_ns   = next_candidate_ns[0]  # (d,)
+        # ── 7. Store the next-state-only prefetch ─────────────────────────────
+        self._switch_prefetch = next_prefetch
 
         self.history.setdefault('time_cost', {}).setdefault('switch_overlap', []).append({
             'from_state': s,
             'to_state'  : next_s,
+            'following_state': following_s,
+            'prefetch_next': bool(prefetch_next),
+            'ingested_pending_on_entry': bool(ingested_pending_on_entry),
+            'q': int(q),
+            'fix_acq_state': None if fix_acq_state is None else bool(fix_acq_state),
+            'acq_state_mode': state_mode,
+            'prefetch_used': prefetch_used,
+            'prefetch_created': next_prefetch is not None,
+            'current_compute_sec': float(current_compute_sec),
+            'current_wait_after_compute_sec': float(current_wait_sec),
+            'compute_sec': float(compute_sec),
+            'switch_oracle_sec': float(switch_oracle_sec),
+            'wait_after_compute_sec': float(wait_sec),
+            'future_done_before_wait': bool(future_done_before_wait),
+            'model_data_lag_after_call': int(len(self.dataset._x) - self._model_raw_count),
         })
 
     def recommend(
@@ -781,12 +1024,39 @@ class MultiStateBO:
                          acq_type: Optional[str] = None,
                          beta: Optional[float] = None,
                          X_pending: Optional[Tensor] = None,
-                         fixed_state: Optional[str] = None):
+                         fixed_state: Optional[str] = None,
+                         condition_on_state: Optional[str] = None):
 
         acq_type = acq_type if acq_type is not None else "qEI"
 
         if X_pending is None and self.X_pending is not None:
             X_pending = torch.as_tensor(self.X_pending, device=self.device, dtype=self.dtype).view(1, 1, -1)
+
+        if fixed_state is not None and condition_on_state is not None:
+            raise ValueError("fixed_state and condition_on_state are mutually exclusive")
+
+        if condition_on_state is not None:
+            if acq_type not in ("LogEI", "EI", "qLogEI", "qEI", None):
+                raise ValueError(
+                    "conditional state acquisition currently supports EI/LogEI only"
+                )
+            if isinstance(condition_on_state, int):
+                s_idx = condition_on_state
+            else:
+                s_idx = self.states.index(condition_on_state)
+            if not (0 <= s_idx < self.S):
+                raise ValueError(f"s_idx {s_idx} out of range for S={self.S}")
+            return conditional_state_qLogEI(
+                model=self.model,
+                best_f=self.Y_best,
+                xi=0.0,
+                objective=self.mc_objective,
+                X_pending=X_pending,
+                mc_samples=self.fixed_mc_samples,
+                S=self.S,
+                J=self.J,
+                s_idx=s_idx,
+            )
 
         if fixed_state is None:
             if acq_type in ("LogEI", "EI", "qLogEI", "qEI", None):
@@ -821,7 +1091,10 @@ class MultiStateBO:
                 return fixed_state_qLogEI(
                     model=self.model,
                     best_f=self.Y_best,
-                    xi=0.01,
+                    # Keep the threshold scale-free and comparable with the
+                    # global qLogEI path.  Users can encode a meaningful target
+                    # in the objective itself if desired.
+                    xi=0.0,
                     objective=self.mc_objective,
                     X_pending=X_pending,
                     mc_samples=self.fixed_mc_samples,
@@ -988,6 +1261,7 @@ class MultiStateBO:
                         beta: Optional[float] = None,
                         X_pending: Optional[Tensor] = None,
                         fixed_state: Optional[str] = None,
+                        condition_on_state: Optional[str] = None,
                         acq_type: Optional[str] = None
                         ):
         assert self.model is not None, "Call init() first."
@@ -996,7 +1270,8 @@ class MultiStateBO:
         if acq_function is None:
             acq_function = self._get_acquisition(
                 beta=beta, botorch_bounds=botorch_bounds, X_pending=X_pending,
-                fixed_state=fixed_state, acq_type=acq_type
+                fixed_state=fixed_state, condition_on_state=condition_on_state,
+                acq_type=acq_type
             )
 
         best_candidate_t = None
@@ -1055,6 +1330,7 @@ class MultiStateBO:
         self.history.setdefault('acq_opt', []).append({
             "acq_type": acq_type,
             "fixed_state": fixed_state,
+            "condition_on_state": condition_on_state,
             "time_sec": float(dt),
             "best_val": float(best_val),
             "info": best_info,
