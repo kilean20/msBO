@@ -8,7 +8,7 @@ from botorch.posteriors.gpytorch import GPyTorchPosterior
 from botorch.sampling.base import MCSampler
 from gpytorch.distributions import MultivariateNormal
 
-from msBO.acquisition import conditional_state_qLogEI
+from msBO.acquisition import conditional_state_qLogEI, fixed_state_qLogEI
 
 
 class FixedObservationSampler(MCSampler):
@@ -140,3 +140,25 @@ def test_conditional_supports_real_multitaskgp_likelihoods(fixed_noise):
     assert torch.isfinite(value).all()
     assert X.grad is not None
     assert torch.isfinite(X.grad).all()
+
+
+def test_legacy_fixed_state_logei_constructs_and_evaluates():
+    train_X = torch.tensor(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        dtype=torch.float64,
+    )
+    train_Y = torch.tensor([[0.0], [1.0], [1.0], [0.0]], dtype=torch.float64)
+    model = MultiTaskGP(train_X, train_Y, task_feature=-1).eval()
+    acquisition = fixed_state_qLogEI(
+        model=model,
+        best_f=-1.0,
+        S=2,
+        J=1,
+        s_idx=0,
+        objective=GenericMCObjective(lambda samples, X=None: -samples.var(dim=-1)),
+        mc_samples=8,
+    )
+
+    value = acquisition(torch.tensor([[[0.5]]], dtype=torch.float64))
+
+    assert torch.isfinite(value).all()

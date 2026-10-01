@@ -1,7 +1,9 @@
 import os
 import sys
+from concurrent.futures import Future
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -12,7 +14,11 @@ os.environ["EPICS_CA_AUTO_ADDR_LIST"] = "NO"
 MACHINEIO_PROJECT = Path(__file__).resolve().parents[1] / "machineIO"
 sys.path.insert(0, str(MACHINEIO_PROJECT))
 
-from machineIO.construct_machineIO import AbstractMachineIO, construct_machineIO
+from machineIO.construct_machineIO import (
+    AbstractMachineIO,
+    StatefulOracleEvaluator,
+    construct_machineIO,
+)
 
 
 class SequencedMachine(AbstractMachineIO):
@@ -97,3 +103,28 @@ def test_exception_waittime_is_validated_and_serialized():
     payload = machine.to_dump_dict(include_history=False)
     restored = construct_machineIO.from_dump_dict(payload, test=True)
     assert restored.ensure_set_exception_waittime == pytest.approx(7.5)
+
+
+def test_stateful_async_read_infers_state_from_readback_without_x_context():
+    evaluator = object.__new__(StatefulOracleEvaluator)
+    evaluator.state_CSETs = ["Q:I_CSET"]
+    evaluator.state_RDs = ["Q:I_RD"]
+    evaluator.state_tols = np.asarray([0.1])
+    evaluator.state_key_vals = {"low": [1.0], "high": [2.0]}
+    evaluator.state_df_manipulators = None
+    evaluator.oracle_key_names = {"x": ["X:I_RD"], "state": ["state"]}
+
+    future = Future()
+    # Deliberately disagreeing CSET proves that state detection uses the
+    # measured readback. No variable named x is available to get_result().
+    future.set_result(pd.DataFrame({
+        "Q:I_CSET": [1.0, 1.0],
+        "Q:I_RD": [2.01, 1.99],
+        "X:I_RD": [3.0, 3.2],
+    }))
+    future._state_context = None
+
+    result = evaluator.get_result(future)
+
+    assert result["state"].tolist() == ["high"]
+    assert result["x"].tolist() == pytest.approx([3.1])

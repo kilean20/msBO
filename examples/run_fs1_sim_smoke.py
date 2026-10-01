@@ -81,7 +81,7 @@ def instrument_for_simulation(notebook, *, smoke_test: bool):
 
         if smoke_test:
             source = source.replace("N_INIT = 2 * (D + 1)", "N_INIT = 2")
-            source = source.replace("N_ROUNDS = 2 * D", "N_ROUNDS = 1")
+            source = source.replace("N_ROUNDS = D", "N_ROUNDS = 1")
             source = source.replace("acq_restarts=8,", "acq_restarts=2,")
             source = source.replace("acq_raw_samples=128,", "acq_raw_samples=16,")
             source = source.replace("acq_maxiter=100,", "acq_maxiter=20,")

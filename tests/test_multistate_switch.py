@@ -344,3 +344,28 @@ def test_closed_cycle_adds_exactly_q_measurements_per_state(n_states, q):
         bo.executor.shutdown(wait=True)
 
     assert Counter(row["state"] for row in measurements) == Counter({s: q for s in states})
+
+
+def test_turbo_uses_composite_improvement_not_last_raw_task():
+    bo = MultiStateBO.__new__(MultiStateBO)
+    bo.dataset = SimpleNamespace(_x=[torch.tensor([0.0])])
+    bo.Y_best = 1.02
+    bo.TurBO_success_threshold = 0.01
+    bo.TurBO_success_counter = 0
+    bo.TurBO_failure_counter = 0
+    bo.TurBO_success_tolerance = 1
+    bo.TurBO_failure_tolerance = 2
+    bo.local_bound_size = np.array([0.2])
+    bo.local_bound_size_ref = np.array([0.2])
+    bo.local_bound_size_min = np.array([0.02])
+    bo.control_min = np.array([0.0])
+    bo.control_max = np.array([1.0])
+    bo.history = {}
+
+    bo._update_turbo_counters_and_trust_region(previous_best=1.0)
+
+    assert bo.local_bound_size.tolist() == pytest.approx([0.4])
+    row = bo.history["trust_region"][-1]
+    assert row["improvement"] == pytest.approx(0.02)
+    assert row["required_improvement"] == pytest.approx(0.01)
+    assert row["grew"]

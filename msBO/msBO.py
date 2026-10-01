@@ -57,7 +57,7 @@ class MultiStateBO:
                  model_warmstart_epochs: int = 50, # epochs when warm-starting from prev model
                  TurBO_failure_tolerance=999,
                  TurBO_success_tolerance=2,
-                 TurBO_success_threshold=0.95,
+                 TurBO_success_threshold=1e-3,
                  control_names: Optional[List[str]] = None,
                  device: Optional[torch.device] = None,
                  dtype: Optional[torch.dtype] = None,
@@ -225,8 +225,9 @@ class MultiStateBO:
         t1 = time.monotonic()
         self.history['model_train_loss'].append(loss_history)
         self.history['time_cost']['model_train'].append(t1 - t0)
+        previous_best = self.Y_best
         self.X_best, self.Y_best = self._get_model_based_X_best()
-        self._update_turbo_counters_and_trust_region()
+        self._update_turbo_counters_and_trust_region(previous_best=previous_best)
         self._model_raw_count = len(self.dataset._x)
 
         # Snapshot predictions after training
@@ -1339,20 +1340,32 @@ class MultiStateBO:
         best_candidate = best_candidate_t.view(-1).cpu().numpy()
         return best_candidate
 
-    def _update_turbo_counters_and_trust_region(self):
-        """TurBO counters & trust-region update using the last task's value vs a threshold."""
-        if len(self.dataset._x) == 0:
+    def _update_turbo_counters_and_trust_region(self, previous_best=None):
+        """Update the trust region from relative composite-objective improvement."""
+        if len(self.dataset._x) == 0 or self.Y_best is None:
             return
 
-        # Read last measurement vector y (shape: J,) and take its last element
-        y_last = self.dataset._y[-1]
-        if torch.is_tensor(y_last):
-            val = float(y_last[-1].detach().cpu().item())
-        else:
-            val = float(np.asarray(y_last, dtype=float)[-1])
+        current_best = float(self.Y_best)
+        if previous_best is None:
+            self.history.setdefault("trust_region", []).append({
+                "previous_best": None,
+                "current_best": current_best,
+                "improvement": None,
+                "required_improvement": None,
+                "success_counter": int(self.TurBO_success_counter),
+                "failure_counter": int(self.TurBO_failure_counter),
+                "grew": False,
+                "shrank": False,
+                "local_bound_size": self.local_bound_size.copy(),
+            })
+            return
 
-        thr = float(self.TurBO_success_threshold)
-        is_success = (val >= thr)
+        previous_best = float(previous_best)
+        improvement = current_best - previous_best
+        required_improvement = float(self.TurBO_success_threshold) * max(
+            1.0, abs(previous_best)
+        )
+        is_success = improvement > required_improvement
 
         # Update counters
         if is_success:
@@ -1367,18 +1380,26 @@ class MultiStateBO:
 
         # Adjust trust region on threshold hits
         if self.TurBO_success_counter >= self.TurBO_success_tolerance:
+            maximum_size = np.minimum(
+                self.local_bound_size_ref * 8.0,
+                self.control_max - self.control_min,
+            )
             self.local_bound_size = np.minimum(
                 self.local_bound_size * 2.0,
-                self.local_bound_size_ref * 8.0,
+                maximum_size,
             )
             grew = True
             self.TurBO_success_counter = 0
             self.TurBO_failure_counter = 0
 
         elif self.TurBO_failure_counter >= self.TurBO_failure_tolerance:
+            minimum_size = np.maximum(
+                self.local_bound_size_ref / 8.0,
+                self.local_bound_size_min,
+            )
             self.local_bound_size = np.maximum(
                 self.local_bound_size / 2.0,
-                self.local_bound_size_ref / 8.0,
+                minimum_size,
             )
             shrank = True
             self.TurBO_success_counter = 0
@@ -1387,8 +1408,10 @@ class MultiStateBO:
         # Optional breadcrumb
         if hasattr(self, "history"):
             self.history.setdefault("trust_region", []).append({
-                "last_task_value": val,
-                "threshold": thr,
+                "previous_best": previous_best,
+                "current_best": current_best,
+                "improvement": improvement,
+                "required_improvement": required_improvement,
                 "success_counter": int(self.TurBO_success_counter),
                 "failure_counter": int(self.TurBO_failure_counter),
                 "grew": grew,

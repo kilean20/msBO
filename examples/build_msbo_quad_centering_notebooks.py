@@ -43,12 +43,16 @@ CONFIGS = {
         "state_setup": dedent(
             """
             quad_nominal = np.asarray([read_numeric_scalar(pv) for pv in state_CSETs], dtype=float)
-            states = ["nominal", "low_85pct", "high_115pct"]
-            state_key_vals = {
-                "nominal": quad_nominal.tolist(),
-                "low_85pct": (0.85 * quad_nominal).tolist(),
-                "high_115pct": (1.15 * quad_nominal).tolist(),
-            }
+            quad_scan_amplitudes = 0.15 * np.abs(quad_nominal)
+            scan_code_matrix = regular_simplex_scan_codes(len(state_CSETs))
+            states = [f"simplex_{i + 1:02d}" for i in range(len(scan_code_matrix))]
+            nominal_state = "nominal"
+            state_key_vals = {nominal_state: quad_nominal.tolist()}
+            state_key_vals.update({
+                state: (quad_nominal + code * quad_scan_amplitudes).tolist()
+                for state, code in zip(states, scan_code_matrix)
+            })
+            reference_states = [nominal_state, *states]
             """
         ),
     },
@@ -78,12 +82,16 @@ CONFIGS = {
         "state_setup": dedent(
             """
             quad_nominal = np.asarray([read_numeric_scalar(pv) for pv in state_CSETs], dtype=float)
-            states = ["nominal", "low_85pct", "high_115pct"]
-            state_key_vals = {
-                "nominal": quad_nominal.tolist(),
-                "low_85pct": (0.85 * quad_nominal).tolist(),
-                "high_115pct": (1.15 * quad_nominal).tolist(),
-            }
+            quad_scan_amplitudes = 0.15 * np.abs(quad_nominal)
+            scan_code_matrix = regular_simplex_scan_codes(len(state_CSETs))
+            states = [f"simplex_{i + 1:02d}" for i in range(len(scan_code_matrix))]
+            nominal_state = "nominal"
+            state_key_vals = {nominal_state: quad_nominal.tolist()}
+            state_key_vals.update({
+                state: (quad_nominal + code * quad_scan_amplitudes).tolist()
+                for state, code in zip(states, scan_code_matrix)
+            })
+            reference_states = [nominal_state, *states]
             """
         ),
     },
@@ -114,11 +122,16 @@ CONFIGS = {
         "state_setup": dedent(
             """
             quad_nominal = np.asarray([read_numeric_scalar(pv) for pv in state_CSETs], dtype=float)
-            states = ["nominal", "plus_5AQ"]
-            state_key_vals = {
-                "nominal": quad_nominal.tolist(),
-                "plus_5AQ": (quad_nominal + 5.0 * AQ).tolist(),
-            }
+            quad_scan_amplitudes = np.full(len(state_CSETs), 5.0 * AQ, dtype=float)
+            scan_code_matrix = regular_simplex_scan_codes(len(state_CSETs))
+            states = [f"simplex_{i + 1:02d}" for i in range(len(scan_code_matrix))]
+            nominal_state = "nominal"
+            state_key_vals = {nominal_state: quad_nominal.tolist()}
+            state_key_vals.update({
+                state: (quad_nominal + code * quad_scan_amplitudes).tolist()
+                for state, code in zip(states, scan_code_matrix)
+            })
+            reference_states = [nominal_state, *states]
             """
         ),
     },
@@ -149,6 +162,7 @@ def notebook(location: str, cfg: dict) -> dict:
             f"decision_CSETs = {decision_csets}",
             'decision_RDs = [pv.replace(\":I_CSET\", \":I_RD\") for pv in decision_CSETs]',
             f"objective_RDs = {objective_rds}",
+            'bpm_mag_RDs = [pv.replace(":XPOS_RD", ":MAG_RD") for pv in objective_RDs]',
             f"state_CSETs = {quad_csets}",
             'state_RDs = [pv.replace(\":I_CSET\", \":I_RD\") for pv in state_CSETs]',
             "",
@@ -159,6 +173,12 @@ def notebook(location: str, cfg: dict) -> dict:
             "state_tols = [1.0] * len(state_CSETs)",
             "bpm_norms = [1.0] * len(objective_RDs)   # 1 mm scale for each BPM X reading",
             "bpm_weights = [1.0] * len(objective_RDs)",
+            "scan_delta_matrix = scan_code_matrix * quad_scan_amplitudes[None, :]",
+            "scan_gram = scan_code_matrix.T @ scan_code_matrix",
+            "assert len(states) == len(state_CSETs) + 1",
+            "assert np.all(np.isfinite(quad_scan_amplitudes)) and np.all(quad_scan_amplitudes > 0)",
+            "assert np.allclose(scan_code_matrix.mean(axis=0), 0.0, atol=1e-12)",
+            "assert np.allclose(scan_gram, np.eye(len(state_CSETs)) * scan_gram[0, 0], atol=1e-12)",
             "",
             "config_table = pd.DataFrame({",
             '    "control": decision_CSETs,',
@@ -169,6 +189,7 @@ def notebook(location: str, cfg: dict) -> dict:
             "})",
             "display(config_table)",
             "display(pd.DataFrame(state_key_vals, index=state_CSETs))",
+            "display(pd.DataFrame(scan_code_matrix, index=states, columns=state_CSETs))",
         ]
     )
 
@@ -181,8 +202,9 @@ def notebook(location: str, cfg: dict) -> dict:
 
             This is the msBO replacement for the corresponding LSQ notebook.  The steering
             controls are optimized so that downstream BPM X positions change as little as
-            possible when the selected quadrupoles are scanned together.  The original LSQ
-            notebook is left unchanged.
+            possible under a minimum-size, full-rank set of simultaneous quadrupole
+            perturbations. The coded scan separates the individual quadrupole responses
+            without requiring one-at-a-time scans. The original LSQ notebook is left unchanged.
 
             > **Machine-facing notebook:** configuration cells only read PVs, but the cells
             > marked **MOVES THE MACHINE** ramp real controls.  Review the printed bounds and
@@ -220,7 +242,7 @@ def notebook(location: str, cfg: dict) -> dict:
 
             try:
                 from msBO import MultiStateBO
-                from msBO.objective import QuadrupoleCentering
+                from msBO.objective import QuadrupoleCentering, regular_simplex_scan_codes
                 from machineIO import construct_machineIO, StatefulOracleEvaluator
             except ImportError as exc:
                 raise RuntimeError(
@@ -250,8 +272,9 @@ def notebook(location: str, cfg: dict) -> dict:
             """
             ## Beam identity and machine configuration
 
-            The control bounds and quadrupole scan amplitudes retain the conventions of the
-            LSQ notebook.  `x_start` is captured before optimization and can be restored later.
+            The control bounds and maximum quadrupole perturbations retain the conventions of
+            the LSQ notebook. `x_start` is retained only as a validation baseline; successful
+            optimization and validation leave the recommended controls applied.
             """
         ),
         code(
@@ -298,6 +321,22 @@ def notebook(location: str, cfg: dict) -> dict:
         code(config_source),
         markdown(
             """
+            ## Orthogonal multiplexed quadrupole states
+
+            For `n` quadrupoles, the `n+1` optimization states are the vertices of a
+            zero-mean regular simplex. Its code columns are mutually orthogonal. In the
+            linear scan regime, the BPM variance over these simultaneous perturbations is
+            therefore proportional to the sum of the squared responses to the individual
+            quadrupoles; responses from different quadrupoles cannot cancel in the objective.
+
+            `nominal_state` is deliberately separate from `states`. It is used to enter and
+            leave the scan but is not an extra GP task. The displayed code table is
+            dimensionless; multiplying each column by `quad_scan_amplitudes` gives the actual
+            current perturbations.
+            """
+        ),
+        markdown(
+            """
             ## Read-only machine preflight
 
             This cell does not change any setpoint. It verifies that every required CSET,
@@ -310,7 +349,8 @@ def notebook(location: str, cfg: dict) -> dict:
         code(
             """
             required_numeric_pvs = list(dict.fromkeys(
-                decision_CSETs + decision_RDs + state_CSETs + state_RDs + objective_RDs
+                decision_CSETs + decision_RDs + state_CSETs + state_RDs
+                + objective_RDs + bpm_mag_RDs
             ))
             pv_snapshot = {pv: read_numeric_scalar(pv) for pv in required_numeric_pvs}
 
@@ -323,11 +363,11 @@ def notebook(location: str, cfg: dict) -> dict:
             if not np.all((x_start >= decision_min) & (x_start <= decision_max)):
                 raise RuntimeError("Captured starting controls lie outside the requested optimization bounds")
 
-            for i, state_a in enumerate(states):
+            for i, state_a in enumerate(reference_states):
                 va = np.asarray(state_key_vals[state_a], dtype=float)
                 if va.shape != (len(state_CSETs),) or not np.all(np.isfinite(va)):
                     raise RuntimeError(f"Invalid categorical-state configuration: {state_a} -> {va}")
-                for state_b in states[i + 1:]:
+                for state_b in reference_states[i + 1:]:
                     vb = np.asarray(state_key_vals[state_b], dtype=float)
                     if np.all(np.abs(va - vb) <= 2.0 * np.asarray(state_tols)):
                         raise RuntimeError(
@@ -369,8 +409,10 @@ def notebook(location: str, cfg: dict) -> dict:
             batch contains two candidates—the control dimension—so qEI can choose a diverse
             pair while the model is retrained half as often as in single-candidate BO.
 
-            Four balanced rounds, `2d`, add eight adaptive settings per state. Thus every
-            state receives fourteen measurements total. Each round is a closed state cycle:
+            Two balanced rounds, `d`, add four adaptive settings per state. Thus every
+            state receives ten measurements total. This gives 50 optimization evaluations
+            for the four-quadrupole section and 30 for either two-quadrupole section. Each
+            round is a closed state cycle:
             one candidate is measured while entering a state and `q-1` while leaving it. State
             order is rotated and reversed between rounds to avoid systematic ordering bias.
             """
@@ -379,18 +421,20 @@ def notebook(location: str, cfg: dict) -> dict:
             """
             D = len(decision_CSETs)
             S = len(states)
-            J = len(objective_RDs)
+            N_POSITION_TASKS = len(objective_RDs)
+            J = N_POSITION_TASKS + 1  # BPM X positions plus one beam-transmission task
 
             N_INIT = 2 * (D + 1)   # 6 shared Sobol control settings per state for d=2
             BATCH_SIZE = D         # q=2 jointly selected candidates
-            N_ROUNDS = 2 * D       # 4 balanced BO rounds
+            N_ROUNDS = D           # 2 balanced BO rounds
             ACQ_STATE_MODE = "conditional"  # switch scheduler default; keep "global" as benchmark
             EXPECTED_ORACLE_CALLS = S * (N_INIT + BATCH_SIZE * N_ROUNDS)
 
             assert D == 2, "Revisit the budget if the number of steering controls changes."
             assert S >= 2, "Quadrupole centering needs at least two scan states."
             assert ACQ_STATE_MODE in {"global", "conditional", "mean"}
-            print(f"d={D}, states={S}, BPM tasks/state={J}")
+            print(f"d={D}, states={S}, BPM-position tasks/state={N_POSITION_TASKS}")
+            print("Additional task/state: minimum BPM magnitude ratio")
             print(f"Budget: {N_INIT} initial + {N_ROUNDS}×{BATCH_SIZE} BO calls per state")
             print(f"Expected optimization-dataset evaluations: {EXPECTED_ORACLE_CALLS}")
             """
@@ -423,22 +467,56 @@ def notebook(location: str, cfg: dict) -> dict:
             """
             ## Objective and oracle
 
-            For BPM (j), msBO predicts its position at every quadrupole state.  The objective is
+            For BPM (j), msBO predicts its position at every quadrupole state. The centering
+            component of the objective is
 
             \[
             f(x)=-\\frac{1}{\\sum_j w_j}\\sum_j w_j\\,\\mathrm{{Var}}_s
             \\left[\\frac{{y_{{s,j}}(x)}}{{n_j}}\\right].
             \]
 
-            Maximizing this objective drives the quadrupole-scan slopes toward zero.  Unlike a
+            Maximizing this component drives the quadrupole-scan response toward zero. Unlike a
             generic trajectory-centering objective, it does not incorrectly demand zero position
-            at downstream BPMs.  This matches the original LSQ objective's
-            `var_obj_weight_fraction=1.0` behavior.
+            at downstream BPMs.
+
+            Before BO initialization, the notebook also records a BPM-magnitude reference at
+            every quadrupole state. At every later evaluation it forms
+            `min_bpm(measured_magnitude / state_reference)`. The worst-state loss fraction is
+            divided by 0.10, so approximately 5% loss contributes 0.5 penalty and 10% loss
+            contributes 1.0 penalty. This protects against a lost or strongly attenuated beam
+            appearing artificially insensitive to the quadrupole scan.
             """
         ),
         code(
             """
-            oracle_key_names = {"x": decision_CSETs, "y": objective_RDs}
+            BPM_MAGs_ref = {}
+
+            def BPM_MAG_obj(df, s):
+                if s not in BPM_MAGs_ref:
+                    raise RuntimeError(f"No BPM magnitude reference has been captured for state {s!r}")
+                reference = np.asarray(BPM_MAGs_ref[s], dtype=float)
+                ratios = df[bpm_mag_RDs].to_numpy(dtype=float) / reference[None, :]
+                df = df.copy()
+                df["BPM:MAG_min_ratio"] = ratios.min(axis=1)
+                return df
+
+            reference_oracle = StatefulOracleEvaluator(
+                machine,
+                control_CSETs=decision_CSETs,
+                control_RDs=decision_RDs,
+                control_tols=decision_tols,
+                state_CSETs=state_CSETs,
+                state_RDs=state_RDs,
+                state_tols=state_tols,
+                state_key_vals=state_key_vals,
+                oracle_key_names={"x": decision_RDs, "y": bpm_mag_RDs},
+                monitor_PVs=bpm_mag_RDs,
+            )
+
+            oracle_key_names = {
+                "x": decision_RDs,
+                "y": objective_RDs + ["BPM:MAG_min_ratio"],
+            }
             oracle = StatefulOracleEvaluator(
                 machine,
                 control_CSETs=decision_CSETs,
@@ -449,7 +527,8 @@ def notebook(location: str, cfg: dict) -> dict:
                 state_tols=state_tols,
                 state_key_vals=state_key_vals,
                 oracle_key_names=oracle_key_names,
-                monitor_PVs=objective_RDs,
+                monitor_PVs=objective_RDs + bpm_mag_RDs,
+                state_df_manipulators=[BPM_MAG_obj],
             )
 
             composite_objective = QuadrupoleCentering(
@@ -457,6 +536,9 @@ def notebook(location: str, cfg: dict) -> dict:
                 J=J,
                 norms=bpm_norms,
                 weights=bpm_weights,
+                beam_loss_task=True,
+                beam_loss_weight=1.0,
+                beam_loss_scale=0.10,
             )
             """
         ),
@@ -464,9 +546,11 @@ def notebook(location: str, cfg: dict) -> dict:
             """
             ## Operator gate
 
-            The next cell is the first one that moves the machine.  It first restores the captured
-            starting controls and nominal quadrupoles, then collects the initial design and runs
-            balanced qEI batches. `ACQ_STATE_MODE="conditional"` matches the default switch
+            The next cell is the first one that moves the machine. It first measures BPM-magnitude
+            references at the captured starting controls for nominal and every coded
+            quadrupole state, returns to nominal, then collects the initial design and runs
+            balanced qEI batches.
+            `ACQ_STATE_MODE="conditional"` matches the default switch
             scheduler behavior. It samples the incoming state's possible noisy BPM readings and
             propagates their information through GP cross-state covariance without fitting
             fantasy models. The matched 20-seed benchmark was not statistically decisive, so
@@ -499,76 +583,96 @@ def notebook(location: str, cfg: dict) -> dict:
                     "only after reviewing the preflight tables and run budget."
                 )
 
-            try:
-                # Establish a known nominal starting condition before MultiStateBO reads x0.
-                oracle(x=x_start, s=states[0])
+            # Capture a state-specific no-loss reference before BO initialization.
+            BPM_MAGs_ref.clear()
+            for state in reference_states:
+                reference_result = reference_oracle(x=x_start, s=state)
+                reference = np.asarray(reference_result["y"], dtype=float)
+                if reference.shape != (len(bpm_mag_RDs),):
+                    raise RuntimeError(
+                        f"Unexpected BPM magnitude reference shape for {state}: {reference.shape}"
+                    )
+                if not np.all(np.isfinite(reference)) or np.any(reference <= 0.0):
+                    raise RuntimeError(
+                        f"Invalid BPM magnitude reference for {state}: {reference}"
+                    )
+                BPM_MAGs_ref[state] = reference
+            display(pd.DataFrame(BPM_MAGs_ref, index=bpm_mag_RDs))
 
-                msbo = MultiStateBO(
-                    states=states,
-                    tasks=objective_RDs,
-                    control_min=decision_min,
-                    control_max=decision_max,
-                    control_names=decision_CSETs,
-                    multistate_oracle_evaluator=oracle,
-                    composite_objective_function=composite_objective,
-                    local_bound_size=0.25 * (np.asarray(decision_max) - np.asarray(decision_min)),
-                    asynchronous=False,
-                    acq_backend="scipy",      # q-batch optimization uses BoTorch/SciPy
-                    acq_restarts=8,
-                    acq_raw_samples=128,
-                    acq_maxiter=100,
-                    fixed_mc_samples=512,
-                    model_train_epochs=200,
-                    model_warmstart_epochs=50,
-                )
+            # Establish a known nominal starting condition before MultiStateBO reads x0.
+            oracle(x=x_start, s=nominal_state)
 
-                msbo.init(n_init=N_INIT, local_optimization=False, seed=seed)
+            msbo = MultiStateBO(
+                states=states,
+                tasks=oracle_key_names["y"],
+                control_min=decision_min,
+                control_max=decision_max,
+                control_names=decision_CSETs,
+                multistate_oracle_evaluator=oracle,
+                composite_objective_function=composite_objective,
+                local_bound_size=0.25 * (np.asarray(decision_max) - np.asarray(decision_min)),
+                asynchronous=False,
+                acq_backend="scipy",      # q-batch optimization uses BoTorch/SciPy
+                acq_restarts=8,
+                acq_raw_samples=128,
+                acq_maxiter=100,
+                fixed_mc_samples=512,
+                model_train_epochs=200,
+                model_warmstart_epochs=50,
+            )
 
-                for round_index in range(N_ROUNDS):
-                    shift = round_index % S
-                    state_order = states[shift:] + states[:shift]
-                    if round_index % 2:
-                        state_order = state_order[::-1]
-                    print(f"Round {round_index + 1}/{N_ROUNDS}: {state_order}")
-                    route = state_order + [state_order[0]]
-                    for i in range(S):
-                        msbo.step_batch_with_switch(
-                            s=route[i],
-                            next_s=route[i + 1],
-                            prefetch_next=i < S - 1,
-                            q=BATCH_SIZE,
-                            local_optimization=False,
-                            acq_type="EI",
-                            acq_state_mode=ACQ_STATE_MODE,
-                        )
+            msbo.init(n_init=N_INIT, local_optimization=False, seed=seed)
 
-                # The last switch result is ingested after its overlapped training pass.
-                msbo.train_model()
-            except BaseException:
-                print("Optimization failed or was interrupted; attempting safe rollback.")
-                try:
-                    oracle(x=x_start, s=states[0])
-                    print("Rollback restored starting controls and nominal quadrupoles.")
-                except BaseException as rollback_error:
-                    print("ROLLBACK FAILED; operator action is required:", rollback_error)
-                raise
+            for round_index in range(N_ROUNDS):
+                shift = round_index % S
+                state_order = states[shift:] + states[:shift]
+                if round_index % 2:
+                    state_order = state_order[::-1]
+                print(f"Round {round_index + 1}/{N_ROUNDS}: {state_order}")
+                route = state_order + [state_order[0]]
+                for i in range(S):
+                    msbo.step_batch_with_switch(
+                        s=route[i],
+                        next_s=route[i + 1],
+                        prefetch_next=i < S - 1,
+                        q=BATCH_SIZE,
+                        local_optimization=False,
+                        acq_type="EI",
+                        acq_state_mode=ACQ_STATE_MODE,
+                    )
+
+            # The last switch result is ingested after its overlapped training pass.
+            msbo.train_model()
+
+            # End the optimization cell at the recommended controls and nominal
+            # quadrupole state. These settings remain applied for validation.
+            x_recommended, predicted_objective = msbo.recommend(local_optimization=False)
+            oracle(x=x_recommended, s=nominal_state)
+            print("Applied recommended controls with nominal quadrupoles.")
 
             actual_calls = len(msbo.dataset._x)
             assert actual_calls == EXPECTED_ORACLE_CALLS, (actual_calls, EXPECTED_ORACLE_CALLS)
             print("Optimization complete; oracle calls:", actual_calls)
 
-            ensure_set_events = [
-                event for event in machine.history
-                if event.get("caller") == "ensure_set"
-            ]
-            ensure_set_retry_count = sum(
-                len(event.get("attempt_statuses", [])) > 1
-                for event in ensure_set_events
-            )
-            ensure_set_continued_timeout_count = sum(
-                bool(event.get("continued_after_timeout", False))
-                for event in ensure_set_events
-            )
+            def summarize_ensure_set_history():
+                events = [
+                    event for event in machine.history
+                    if event.get("caller") == "ensure_set"
+                ]
+                return {
+                    "event_count": len(events),
+                    "retry_count": sum(
+                        len(event.get("attempt_statuses", [])) > 1 for event in events
+                    ),
+                    "continued_after_timeout_count": sum(
+                        bool(event.get("continued_after_timeout", False)) for event in events
+                    ),
+                    "exception_waittime_sec": machine.ensure_set_exception_waittime,
+                }
+
+            ensure_set_summary = summarize_ensure_set_history()
+            ensure_set_retry_count = ensure_set_summary["retry_count"]
+            ensure_set_continued_timeout_count = ensure_set_summary["continued_after_timeout_count"]
             print(
                 "ensure_set retries:", ensure_set_retry_count,
                 "| continued after two timeouts:", ensure_set_continued_timeout_count,
@@ -610,33 +714,72 @@ def notebook(location: str, cfg: dict) -> dict:
             """
             ## Final recommendation and validation scan
 
-            `recommend()` maximizes the posterior mean rather than an exploratory acquisition.
-            The recommended controls are then measured at every quadrupole state.  The last call
-            returns the quadrupoles to nominal while retaining the recommended steering controls.
+            `recommend()` has already maximized the posterior mean and the preceding cell has
+            applied that setting with nominal quadrupoles. This cell independently scans the
+            recommended and starting controls at every quadrupole state. If a machine exception
+            interrupts validation, correct the condition and rerun this cell; its `finally` block
+            returns to the recommended controls and nominal quadrupoles whenever possible.
             """
         ),
         code(
             """
             # MOVES THE MACHINE
-            x_recommended, predicted_objective = msbo.recommend(local_optimization=False)
-
             validation = {}
+            validation_beam_ratio = {}
             before_rows = []
+            before_beam_ratio = {}
             try:
                 for state in states:
                     result = oracle(x=x_recommended, s=state)
-                    validation[state] = np.asarray(result["y"], dtype=float)
+                    measured = np.asarray(result["y"], dtype=float)
+                    validation[state] = measured[:N_POSITION_TASKS]
+                    validation_beam_ratio[state] = float(measured[-1])
                 for state in states:
-                    before_rows.append(
-                        np.asarray(oracle(x=x_start, s=state)["y"], dtype=float)
-                    )
+                    measured = np.asarray(oracle(x=x_start, s=state)["y"], dtype=float)
+                    before_rows.append(measured[:N_POSITION_TASKS])
+                    before_beam_ratio[state] = float(measured[-1])
             finally:
                 # Even if validation is interrupted, leave nominal quadrupoles and
                 # the optimized steering controls applied whenever possible.
-                final_nominal = oracle(x=x_recommended, s=states[0])
+                final_nominal = oracle(x=x_recommended, s=nominal_state)
 
             validation_matrix = np.vstack([validation[s] for s in states])
             before_matrix = np.vstack(before_rows)
+
+            def decode_individual_quad_responses(position_matrix):
+                # First-order BPM response per ampere for each quadrupole. The
+                # second result is the BPM change at that quad's configured
+                # full scan amplitude and is directly comparable across quads.
+                centered = position_matrix - position_matrix.mean(axis=0, keepdims=True)
+                response_per_ampere = np.linalg.lstsq(
+                    scan_delta_matrix, centered, rcond=None
+                )[0]
+                response_at_scan_amplitude = (
+                    response_per_ampere * quad_scan_amplitudes[:, None]
+                )
+                return response_per_ampere, response_at_scan_amplitude
+
+            before_response_per_ampere, before_quad_response = (
+                decode_individual_quad_responses(before_matrix)
+            )
+            after_response_per_ampere, after_quad_response = (
+                decode_individual_quad_responses(validation_matrix)
+            )
+
+            def measured_objective(position_matrix, beam_ratios):
+                task_matrix = np.column_stack([
+                    position_matrix,
+                    [beam_ratios[state] for state in states],
+                ])
+                samples = torch.as_tensor(
+                    task_matrix.reshape(1, 1, -1), dtype=torch.float64
+                )
+                return float(composite_objective(samples).item())
+
+            measured_before_objective = measured_objective(before_matrix, before_beam_ratio)
+            measured_validation_objective = measured_objective(
+                validation_matrix, validation_beam_ratio
+            )
 
             comparison = pd.DataFrame({
                 "BPM": objective_RDs,
@@ -645,7 +788,27 @@ def notebook(location: str, cfg: dict) -> dict:
             })
             display(pd.DataFrame({"control": decision_CSETs, "start": x_start, "recommended": x_recommended}))
             display(comparison)
+            decoded_rows = []
+            for i, quad in enumerate(state_CSETs):
+                for j, bpm in enumerate(objective_RDs):
+                    decoded_rows.append({
+                        "quadrupole": quad,
+                        "BPM": bpm,
+                        "start_response_at_scan_amplitude": before_quad_response[i, j],
+                        "recommended_response_at_scan_amplitude": after_quad_response[i, j],
+                        "start_response_per_ampere": before_response_per_ampere[i, j],
+                        "recommended_response_per_ampere": after_response_per_ampere[i, j],
+                    })
+            decoded_response_table = pd.DataFrame(decoded_rows)
+            display(decoded_response_table)
+            display(pd.DataFrame({
+                "state": states,
+                "start_control_mag_ratio": [before_beam_ratio[s] for s in states],
+                "recommended_control_mag_ratio": [validation_beam_ratio[s] for s in states],
+            }))
             print("Predicted composite objective:", predicted_objective)
+            print("Measured objective at start controls:", measured_before_objective)
+            print("Measured objective at recommended controls:", measured_validation_objective)
             """
         ),
         markdown(
@@ -657,7 +820,9 @@ def notebook(location: str, cfg: dict) -> dict:
         ),
         code(
             """
-            fig, axes = plt.subplots(1, J, figsize=(4 * J, 3), squeeze=False)
+            fig, axes = plt.subplots(
+                1, N_POSITION_TASKS, figsize=(4 * N_POSITION_TASKS, 3), squeeze=False
+            )
             scan_axis = np.arange(S)
             for j, bpm in enumerate(objective_RDs):
                 ax = axes[0, j]
@@ -672,6 +837,31 @@ def notebook(location: str, cfg: dict) -> dict:
             fig.tight_layout()
             plt.show()
 
+            response_limit = max(
+                float(np.max(np.abs(before_quad_response))),
+                float(np.max(np.abs(after_quad_response))),
+                1e-12,
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), sharex=True, sharey=True)
+            for ax, matrix, title in zip(
+                axes,
+                [before_quad_response, after_quad_response],
+                ["Start controls", "Recommended controls"],
+            ):
+                image = ax.imshow(
+                    matrix, cmap="coolwarm", vmin=-response_limit, vmax=response_limit,
+                    aspect="auto",
+                )
+                ax.set_xticks(np.arange(N_POSITION_TASKS), objective_RDs, rotation=30, ha="right")
+                ax.set_yticks(np.arange(len(state_CSETs)), state_CSETs)
+                ax.set_title(title)
+                ax.set_xlabel("BPM")
+            axes[0].set_ylabel("Individually decoded quadrupole")
+            fig.colorbar(image, ax=axes, label="BPM change at configured scan amplitude")
+            fig.suptitle("Decoded individual-quadrupole feed-down responses")
+            fig.subplots_adjust(bottom=0.3, top=0.82, right=0.88, wspace=0.15)
+            plt.show()
+
             msbo.plot_composite_objective()
             plt.show()
             """
@@ -681,6 +871,10 @@ def notebook(location: str, cfg: dict) -> dict:
             f"""
             now = datetime.datetime.now().strftime("%Y%m%d_%H%M")
             output_path = Path(f"{{now}}[{{ion}}]{filename_tag}.json")
+            # Recompute after reference capture, optimization, validation, and
+            # final nominal application so the saved audit covers every
+            # automatic machine move in this run.
+            ensure_set_summary = summarize_ensure_set_history()
 
             record = {{
                 "method": "msBO qEI quadrupole centering",
@@ -688,11 +882,18 @@ def notebook(location: str, cfg: dict) -> dict:
                 "seed": seed,
                 "acq_state_mode": ACQ_STATE_MODE,
                 "states": states,
+                "nominal_state": nominal_state,
                 "state_key_vals": state_key_vals,
+                "scan_code_matrix": scan_code_matrix.tolist(),
+                "quad_scan_amplitudes": quad_scan_amplitudes.tolist(),
                 "decision_CSETs": decision_CSETs,
                 "decision_min": decision_min,
                 "decision_max": decision_max,
                 "objective_RDs": objective_RDs,
+                "bpm_mag_RDs": bpm_mag_RDs,
+                "bpm_magnitude_reference": {{
+                    k: v.tolist() for k, v in BPM_MAGs_ref.items()
+                }},
                 "budget": {{
                     "n_init_per_state": N_INIT,
                     "batch_size": BATCH_SIZE,
@@ -703,7 +904,15 @@ def notebook(location: str, cfg: dict) -> dict:
                 "x_recommended": x_recommended.tolist(),
                 "predicted_objective": predicted_objective,
                 "validation": {{k: v.tolist() for k, v in validation.items()}},
+                "validation_beam_ratio": validation_beam_ratio,
                 "before_validation": {{s: before_matrix[i].tolist() for i, s in enumerate(states)}},
+                "before_validation_beam_ratio": before_beam_ratio,
+                "before_quad_response_per_ampere": before_response_per_ampere.tolist(),
+                "recommended_quad_response_per_ampere": after_response_per_ampere.tolist(),
+                "before_quad_response_at_scan_amplitude": before_quad_response.tolist(),
+                "recommended_quad_response_at_scan_amplitude": after_quad_response.tolist(),
+                "measured_objective_start": measured_before_objective,
+                "measured_objective_recommended": measured_validation_objective,
                 "dataset": {{
                     "x": [x.detach().cpu().tolist() for x in msbo.dataset._x],
                     "state": [states[i] for i in msbo.dataset._s],
@@ -712,32 +921,10 @@ def notebook(location: str, cfg: dict) -> dict:
                 "training_time_sec": msbo.history["time_cost"]["model_train"],
                 "query_time_sec": msbo.history["time_cost"]["query"],
                 "switch_overlap": msbo.history["time_cost"].get("switch_overlap", []),
-                "machineio_ensure_set": {{
-                    "retry_count": ensure_set_retry_count,
-                    "continued_after_timeout_count": ensure_set_continued_timeout_count,
-                    "exception_waittime_sec": machine.ensure_set_exception_waittime,
-                }},
+                "machineio_ensure_set": ensure_set_summary,
             }}
             output_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
             print("Saved", output_path.resolve())
-            """
-        ),
-        markdown(
-            """
-            ## Optional rollback
-
-            Run only if the operator decides to discard the recommendation.  This restores both
-            the captured steering controls and the nominal quadrupole state.
-            """
-        ),
-        code(
-            """
-            RESTORE_START = False
-            if RESTORE_START:
-                oracle(x=x_start, s=states[0])
-                print("Restored captured starting controls and nominal quadrupoles.")
-            else:
-                print("Rollback not requested; optimized controls remain applied.")
             """
         ),
     ]

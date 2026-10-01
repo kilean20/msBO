@@ -192,6 +192,7 @@ class fixed_state_qLogEI(SampleReducingMCAcquisitionFunction):
         sampler: Optional[MCSampler] = None,
         X_pending: Optional[Tensor] = None,
         mc_samples: int = 128,
+        eps: float = 1e-12,
     ) -> None:
         if sampler is None:
             sampler = SobolQMCNormalSampler(

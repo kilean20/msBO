@@ -49,14 +49,16 @@ _OBJECTIVE_PVS = [
     "FS1_BMS:BPM_D2537:XPOS_RD",
 ]
 
+_MAGNITUDE_PVS = [pv.replace(":XPOS_RD", ":MAG_RD") for pv in _OBJECTIVE_PVS]
+
 
 def _input_pvs():
     config = {
         pv: {"initial": 0.0, "ramping_rate": 2_000.0}
         for pv in _DECISION_CSETS
     }
-    # Nonzero nominal quadrupoles are essential: percentage scan states would
-    # otherwise collapse to the same categorical configuration.
+    # Nonzero nominal quadrupoles exercise the production percentage-based
+    # amplitude used by the upstream regular-simplex scan designs.
     config.update(
         {
             pv: {"initial": 20.0 + 2.0 * index, "ramping_rate": 2_000.0}
@@ -71,7 +73,9 @@ def _input_pvs():
 
 
 def _output_pvs():
-    return {pv: {"min": -8.0, "max": 8.0} for pv in _OBJECTIVE_PVS}
+    config = {pv: {"min": -8.0, "max": 8.0} for pv in _OBJECTIVE_PVS}
+    config.update({pv: {"min": 0.9, "max": 1.1} for pv in _MAGNITUDE_PVS})
+    return config
 
 
 def _static_pvs():
